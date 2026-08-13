@@ -1,21 +1,29 @@
 # OpenFGA Mission Gateway
 
-Reference Go implementation of a Mission-bound gateway for agent actions.
-
-An upstream intent service converts a user request into structured intent. This
-project takes that output and enforces a narrower, expiring Mission over a
-relationship graph when wired to OpenFGA.
+Reference Go implementation of a gateway that constrains agent actions to a
+narrow, expiring Mission. An upstream intent service resolves the user's
+request; this project evaluates the resulting action and resource scope.
 
 ## Example
 
-User request:
+> Read Jira issue `APOLLO-17` and post a summary in `#product`.
 
-    Read Jira issue APOLLO-17 and post a summary in #product.
+The intent service resolves that request to concrete actions and resources:
 
-Structured intent:
-
-    jira.issue.read       jira_issue:APOLLO-17
-    slack.message.post    slack_channel:product
+```json
+{
+  "grants": [
+    {
+      "action": "jira.issue.read",
+      "resource": "jira_issue:APOLLO-17"
+    },
+    {
+      "action": "slack.message.post",
+      "resource": "slack_channel:product"
+    }
+  ]
+}
+```
 
 The gateway permits a call only when:
 
@@ -56,10 +64,12 @@ enforces the resulting relationships.
 
 Requires Go 1.23+.
 
-    git clone https://github.com/Siddhant-K-code/openfga-mission-gateway.git
-    cd openfga-mission-gateway
-    go test ./...
-    go run ./cmd/demo
+```sh
+git clone https://github.com/Siddhant-K-code/openfga-mission-gateway.git
+cd openfga-mission-gateway
+go test ./...
+go run ./cmd/demo
+```
 
 The demo walks through:
 
@@ -72,10 +82,12 @@ The demo walks through:
 
 ## Layout
 
-    cmd/demo/                 runnable example
-    internal/mission/         Mission service, gateway, FGA adapters, tests
-    model.fga                 OpenFGA model
-    tuples.json               durable Jira and Slack example relationships
+| Path | Purpose |
+| --- | --- |
+| `cmd/demo` | Runnable example. |
+| `internal/mission` | Mission service, gateway, FGA adapters, and tests. |
+| `model.fga` | OpenFGA authorization model. |
+| `tuples.json` | Durable Jira and Slack example relationships. |
 
 The Mission service writes Mission-specific tuples when a user approves a
 Mission. The default tests use an in-memory evaluator; OpenFGAHTTP calls the

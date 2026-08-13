@@ -1,14 +1,41 @@
 # OpenFGA Mission Gateway
 
-Reference Go implementation of a gateway that constrains agent actions to a
-narrow, expiring Mission. An upstream intent service resolves the user's
-request; this project evaluates the resulting action and resource scope.
+Reference Go implementation of a policy enforcement point for delegated agent
+actions. A Mission gives a dedicated agent a short-lived, explicit subset of a
+user's current authority; the gateway evaluates that subset before every tool
+or API call.
+
+It does not turn a user's broad application access into an agent bearer token.
+
+## The Model
+
+A Mission binds:
+
+- a requester: `user:alice`;
+- a workload identity: `agent:triage`;
+- exact action and resource grants;
+- expiry, state, and version; and
+- optional approval before an external side effect.
+
+The gateway allows a request only when every gate passes:
+
+| Gate | Evaluated from | Example |
+| --- | --- | --- |
+| Token and lifecycle | Signed Mission token and Mission service | Signature is valid; Mission is active, current, and unexpired. |
+| Agent binding | Token and OpenFGA | `agent:triage` is the Mission executor. |
+| Current base access | OpenFGA source graph | Alice can still read `APOLLO-17`. |
+| Delegated scope | OpenFGA Mission tuples | This Mission permits a read of `APOLLO-17`, not every Jira issue. |
+| Egress approval | Mission service | Alice approved the Slack message preview. |
+
+Any failed gate blocks the call and records a structured decision with the
+failed check.
 
 ## Example
 
 > Read Jira issue `APOLLO-17` and post a summary in `#product`.
 
-The intent service resolves that request to concrete actions and resources:
+An upstream intent service and resolver turn that request into canonical IDs.
+Those systems are outside this repository.
 
 ```json
 {
@@ -21,46 +48,68 @@ The intent service resolves that request to concrete actions and resources:
       "action": "slack.message.post",
       "resource": "slack_channel:product"
     }
-  ]
+  ],
+  "requires_egress_approval": true
 }
 ```
 
-The gateway permits a call only when:
+On approval, the Mission service writes the narrowed relationships below. The
+source graph remains separate from the delegation graph.
 
-1. the Mission is active and its signed token is valid;
-2. the caller matches the Mission's agent identity;
-3. the user still has access to the Jira issue or Slack channel;
-4. the Mission permits that exact action and resource; and
-5. a Slack post has cleared its preview approval gate.
+```text
+# Existing application authority
+user:alice              can_read       jira_issue:APOLLO-17
+user:alice              can_post       slack_channel:product
 
-An agent does not inherit the user's broad application permissions.
+# Mission-specific delegation
+agent:triage            executor       mission:apollo-17-product-summary-v1
+jira_issue:APOLLO-17    read_issue     mission:apollo-17-product-summary-v1
+slack_channel:product   post_channel   mission:apollo-17-product-summary-v1
+```
 
-## Flow
+`model.fga` defines those relations. `tuples.json` holds the durable Jira and
+Slack relationships used by the example.
+
+## Request Flow
 
 ```mermaid
 flowchart LR
     U[User request] --> I[Intent service]
     I --> R[Tool and resource resolver]
     R --> F[OpenFGA candidate filter]
-    F --> M[Mission service]
+    F --> M[Mission approval]
     M --> T[Signed Mission token]
-    T --> G[Gateway / PEP]
+    T --> G[Gateway]
 
-    J[Synced Jira graph] --> F
-    S[Synced Slack graph] --> F
+    J[Jira relationships] --> F
+    S[Slack relationships] --> F
     J --> G
     S --> G
 
-    G --> JR[Jira issue read]
-    G --> P[Preview approval]
-    P --> SP[Slack post]
+    G --> C{All gates pass?}
+    C -->|yes| A[Tool or API call]
+    C -->|no| D[Denied decision]
 ```
 
-The intent service and resolver are outside this repository. FGA does not do
-semantic search or permission synchronization. It filters resolved IDs and
-enforces the resulting relationships.
+The resolver may use semantic or keyword search to find candidates. FGA then
+filters the resolved IDs against the requester's current access. FGA is not
+used for natural-language interpretation or permission synchronization.
 
-## Run
+## Components
+
+| Component | Responsibility |
+| --- | --- |
+| Intent service and resolver | Interpret the request and produce canonical action/resource candidates. |
+| `FilterAuthorizedCandidates` | Remove candidates the requester cannot currently access. |
+| `MissionService` | Create, approve, revoke, complete, and issue a signed token for Missions. |
+| OpenFGA | Store source relationships and the Mission's explicit action/resource scope. |
+| `Gateway` | Enforce every gate immediately before a downstream call and retain the decision audit log. |
+
+The included `OpenFGAHTTP` adapter calls OpenFGA's standard Check and Write
+APIs. Tests use an in-memory evaluator that implements only the model in this
+repository; it is not a general OpenFGA evaluator.
+
+## Run the Demo
 
 Requires Go 1.23+.
 
@@ -71,45 +120,42 @@ go test ./...
 go run ./cmd/demo
 ```
 
-The demo walks through:
+The demo proves the following sequence:
 
-1. candidate filtering removes a Jira issue Alice cannot read;
-2. the scoped Jira read succeeds;
-3. the Slack post is denied pending preview approval;
-4. the approved post succeeds;
-5. another Slack channel is denied; and
-6. removing Alice's Jira access denies the next read.
+| Step | Expected result |
+| --- | --- |
+| Candidate filtering | `APOLLO-17` remains; an issue Alice cannot read is removed. |
+| Scoped Jira read | Allowed. |
+| Slack post before preview approval | Denied. |
+| Slack post after requester approval | Allowed. |
+| Slack post to a different channel | Denied by Mission scope. |
+| Jira permission revocation | The next read is denied by current base access. |
 
-## Layout
+## Integration Shape
+
+1. Resolve the user request to canonical resource IDs.
+2. Filter those candidates with `FilterAuthorizedCandidates`.
+3. Create a draft with `CreateMissionInput`, including the requester, agent,
+   grants, expiry, and egress policy.
+4. Have the requester approve the Mission, then give the issued token to the
+   agent runtime.
+5. Call `Gateway.Authorize` before each downstream tool or API invocation.
+6. Revoke or complete the Mission when the work ends. Future calls are denied.
+
+## Repository Layout
 
 | Path | Purpose |
 | --- | --- |
-| `cmd/demo` | Runnable example. |
-| `internal/mission` | Mission service, gateway, FGA adapters, and tests. |
+| `cmd/demo` | Runnable Jira-to-Slack flow. |
+| `internal/mission` | Mission service, gateway, FGA adapters, and contract tests. |
 | `model.fga` | OpenFGA authorization model. |
-| `tuples.json` | Durable Jira and Slack example relationships. |
+| `tuples.json` | Example Jira and Slack source relationships. |
 
-The Mission service writes Mission-specific tuples when a user approves a
-Mission. The default tests use an in-memory evaluator; OpenFGAHTTP calls the
-standard Check and Write APIs for a live store.
+## Deliberate Omissions
 
-## Scope
-
-Included:
-
-- agent identity bound to a Mission;
-- action and resource attenuation;
-- expiry, completion, and revocation state;
-- current permission checks at action time; and
-- preview approval before a Slack egress action.
-
-Not included:
-
-- intent classification or embeddings;
-- OAuth or an AAuth Person Server;
-- Jira, Slack, or MCP transport adapters;
-- permission-sync connectors;
-- persistence, UI, child Missions, or cross-domain delegation.
+- Intent classification, embeddings, and resource search.
+- OAuth, SaaS connectors, MCP transport adapters, and permission-sync jobs.
+- Persistence, UI, child Missions, and cross-domain delegation.
 
 ## License
 

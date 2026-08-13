@@ -1,0 +1,40 @@
+model
+  schema 1.1
+
+# Mission V1: intent-to-token input with FGA-backed, action-time enforcement.
+#
+# The Mission service owns intent approval, lifecycle, expiry, version, and
+# runtime-token issuance. OpenFGA owns the durable third-party relationship
+# graph and the Mission's narrowed action/resource scope.
+
+type user
+
+type agent
+
+type jira_project
+  relations
+    define owner: [user]
+    define viewer: [user] or owner
+
+type jira_issue
+  relations
+    define project: [jira_project]
+    define can_read: viewer from project
+
+type slack_channel
+  relations
+    define member: [user]
+    define poster: [user] or member
+    define can_post: poster
+
+type mission
+  relations
+    # The human whose current access the Mission may attenuate.
+    define requester: [user]
+
+    # A dedicated workload identity. The agent does not inherit user access.
+    define executor: [agent]
+
+    # Explicit action-and-resource bounds derived from approved intent.
+    define read_issue: [jira_issue]
+    define post_channel: [slack_channel]

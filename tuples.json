@@ -1,0 +1,41 @@
+{
+  "writes": {
+    "tuple_keys": [
+      {
+        "user": "user:alice",
+        "relation": "owner",
+        "object": "jira_project:apollo"
+      },
+      {
+        "user": "jira_project:apollo",
+        "relation": "project",
+        "object": "jira_issue:APOLLO-17"
+      },
+      {
+        "user": "jira_project:apollo",
+        "relation": "project",
+        "object": "jira_issue:APOLLO-23"
+      },
+      {
+        "user": "user:bob",
+        "relation": "owner",
+        "object": "jira_project:hermes"
+      },
+      {
+        "user": "jira_project:hermes",
+        "relation": "project",
+        "object": "jira_issue:HERMES-1"
+      },
+      {
+        "user": "user:alice",
+        "relation": "member",
+        "object": "slack_channel:product"
+      },
+      {
+        "user": "user:alice",
+        "relation": "member",
+        "object": "slack_channel:company"
+      }
+    ]
+  }
+}

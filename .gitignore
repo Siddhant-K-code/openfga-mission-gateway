@@ -1,0 +1,4 @@
+/bin/
+/cover.out
+*.test
+__pycache__/

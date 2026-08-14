@@ -1,40 +1,33 @@
 model
   schema 1.1
 
-# Mission V1: intent-to-token input with FGA-backed, action-time enforcement.
-#
-# The Mission service owns intent approval, lifecycle, expiry, version, and
-# runtime-token issuance. OpenFGA owns the durable third-party relationship
-# graph and the Mission's narrowed action/resource scope.
+# Durable authority lives in this graph. A Mission token contributes its
+# executor and allowed_call relationships as contextual tuples for one Check.
 
 type user
 
 type agent
 
-type jira_project
+type mcp_server
   relations
-    define owner: [user]
-    define viewer: [user] or owner
+    define operator: [user]
 
-type jira_issue
+type mcp_tool
   relations
-    define project: [jira_project]
-    define can_read: viewer from project
+    define server: [mcp_server]
+    define invoker: [user] or operator from server
+    define can_invoke: invoker
 
-type slack_channel
+type mcp_call
   relations
-    define member: [user]
-    define poster: [user] or member
-    define can_post: poster
+    # A canonical call captures server, tool, and the policy-relevant part of
+    # the input. It can inherit tool access or receive a direct user grant.
+    define tool: [mcp_tool]
+    define invoker: [user] or can_invoke from tool
+    define can_invoke: invoker
 
 type mission
   relations
-    # The human whose current access the Mission may attenuate.
     define requester: [user]
-
-    # A dedicated workload identity. The agent does not inherit user access.
     define executor: [agent]
-
-    # Explicit action-and-resource bounds derived from approved intent.
-    define read_issue: [jira_issue]
-    define post_channel: [slack_channel]
+    define allowed_call: [mcp_call]

@@ -12,7 +12,7 @@ import (
 
 func main() {
 	ctx := context.Background()
-	fga, missions, gateway, token, err := mission.DemoEnvironment(ctx)
+	fga, missions, gateway, token, calls, err := mission.DemoEnvironment(ctx)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -21,64 +21,68 @@ func main() {
 		ctx,
 		fga,
 		"user:alice",
-		mission.ReadJiraIssue,
-		[]string{"jira_issue:APOLLO-17", "jira_issue:HERMES-1"},
+		[]mission.MCPCall{calls.ReadIssue, calls.Inaccessible},
 	)
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("FGA-filtered Jira candidates: %v\n\n", candidates)
+	fmt.Printf("FGA-filtered MCP call candidates: %d allowed\n\n", len(candidates))
 
-	show("allowed Jira read", gateway.Authorize(ctx, mission.AuthorizationRequest{
+	show("allowed scoped MCP call", gateway.Authorize(ctx, mission.AuthorizationRequest{
 		MissionToken: token,
 		Agent:        "agent:triage",
-		Action:       mission.ReadJiraIssue,
-		ResourceID:   "jira_issue:APOLLO-17",
+		Call:         calls.ReadIssue,
 	}, time.Now()))
 
-	show("denied Slack post until user reviews preview", gateway.Authorize(ctx, mission.AuthorizationRequest{
+	show("denied call until preview approval", gateway.Authorize(ctx, mission.AuthorizationRequest{
 		MissionToken: token,
 		Agent:        "agent:triage",
-		Action:       mission.PostSlackMessage,
-		ResourceID:   "slack_channel:product",
+		Call:         calls.PostSummary,
 	}, time.Now()))
 
-	if err := missions.RequestEgressApproval(
+	callID, err := calls.PostSummary.ID()
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := missions.RequestApproval(
 		"apollo-17-product-summary-v1",
+		callID,
 		"APOLLO-17 is delayed; no restricted fields included.",
 	); err != nil {
 		log.Fatal(err)
 	}
-	if err := missions.ApproveEgress(
+	if err := missions.ApproveCall(
 		"apollo-17-product-summary-v1",
+		callID,
 		"user:alice",
 	); err != nil {
 		log.Fatal(err)
 	}
-	show("allowed Slack post after user approval", gateway.Authorize(ctx, mission.AuthorizationRequest{
+	show("allowed call after requester approval", gateway.Authorize(ctx, mission.AuthorizationRequest{
 		MissionToken: token,
 		Agent:        "agent:triage",
-		Action:       mission.PostSlackMessage,
-		ResourceID:   "slack_channel:product",
+		Call:         calls.PostSummary,
 	}, time.Now()))
 
-	show("denied Slack post outside Mission scope", gateway.Authorize(ctx, mission.AuthorizationRequest{
+	show("denied call outside Mission scope", gateway.Authorize(ctx, mission.AuthorizationRequest{
 		MissionToken: token,
 		Agent:        "agent:triage",
-		Action:       mission.PostSlackMessage,
-		ResourceID:   "slack_channel:company",
+		Call:         calls.PostOtherTarget,
 	}, time.Now()))
 
+	serverID, err := calls.ReadIssue.ServerID()
+	if err != nil {
+		log.Fatal(err)
+	}
 	if err := fga.Delete(ctx, []mission.TupleKey{{
-		User: "user:alice", Relation: "owner", Object: "jira_project:apollo",
+		User: "user:alice", Relation: "operator", Object: serverID,
 	}}); err != nil {
 		log.Fatal(err)
 	}
-	show("denied after Jira access revocation", gateway.Authorize(ctx, mission.AuthorizationRequest{
+	show("denied after source access revocation", gateway.Authorize(ctx, mission.AuthorizationRequest{
 		MissionToken: token,
 		Agent:        "agent:triage",
-		Action:       mission.ReadJiraIssue,
-		ResourceID:   "jira_issue:APOLLO-17",
+		Call:         calls.ReadIssue,
 	}, time.Now()))
 }
 

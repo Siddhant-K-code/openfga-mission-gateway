@@ -1,113 +1,121 @@
 # OpenFGA Mission Gateway
 
-Reference Go implementation of a policy enforcement point for delegated agent
-actions. A Mission gives a dedicated agent a short-lived, explicit subset of a
-user's current authority; the gateway evaluates that subset before every tool
-or API call.
+Reference Go implementation of a policy enforcement point for MCP tool calls.
+A Mission gives one agent a short-lived, explicit set of canonical calls. The
+gateway evaluates that authority before it invokes an MCP tool.
 
-It does not turn a user's broad application access into an agent bearer token.
+The engine is domain-agnostic. It models MCP servers, tools, and calls rather
+than Jira, Slack, or application-specific resource types.
 
-## The Model
+## Trust Model
 
 A Mission binds:
 
-- a requester: `user:alice`;
-- a workload identity: `agent:triage`;
-- exact action and resource grants;
-- expiry, state, and version; and
-- optional approval before an external side effect.
+- a requester, such as `user:alice`;
+- a workload identity, such as `agent:triage`;
+- canonical MCP calls: server, tool, and policy-relevant input scope;
+- expiry and lifecycle state; and
+- per-call output approval where required.
 
-The gateway allows a request only when every gate passes:
+The gateway allows a call only when every gate passes:
 
-| Gate | Evaluated from | Example |
+| Gate | Source of truth | Purpose |
 | --- | --- | --- |
-| Token and lifecycle | Signed Mission token and Mission service | Signature is valid; Mission is active, current, and unexpired. |
-| Agent binding | Token and OpenFGA | `agent:triage` is the Mission executor. |
-| Current base access | OpenFGA source graph | Alice can still read `APOLLO-17`. |
-| Delegated scope | OpenFGA Mission tuples | This Mission permits a read of `APOLLO-17`, not every Jira issue. |
-| Egress approval | Mission service | Alice approved the Slack message preview. |
+| Token validity | HMAC-signed Mission token | Identifies the Mission, agent, version, expiry, and permitted call IDs. |
+| Mission state | Mission service | Makes revocation, completion, and approval changes effective immediately. |
+| Agent binding | Token-derived contextual tuple | Prevents another agent from reusing the token. |
+| Current user authority | Durable OpenFGA relationships | The requester must still be allowed to invoke the canonical call. |
+| Mission scope | Token-derived contextual tuple | Restricts the agent to an exact permitted call. |
+| Output approval | Mission service | Requires requester approval before a configured side effect. |
 
-Any failed gate blocks the call and records a structured decision with the
-failed check.
+The agent never sends FGA tuples or self-asserts a scope. The gateway verifies
+the token and derives contextual tuples itself.
 
-## Example
+## Canonical Calls
 
-> Read Jira issue `APOLLO-17` and post a summary in `#product`.
-
-An upstream intent service and resolver turn that request into canonical IDs.
-Those systems are outside this repository.
+An upstream resolver turns a request into a canonical call. It decides which
+input fields matter to policy and passes only those fields in `scope`.
 
 ```json
 {
-  "grants": [
-    {
-      "action": "jira.issue.read",
-      "resource": "jira_issue:APOLLO-17"
-    },
-    {
-      "action": "slack.message.post",
-      "resource": "slack_channel:product"
-    }
-  ],
-  "requires_egress_approval": true
+  "server": "work-tracker",
+  "tool": "get_issue",
+  "scope": {
+    "issue_id": "APOLLO-17"
+  }
 }
 ```
 
-On approval, the Mission service writes the narrowed relationships below. The
-source graph remains separate from the delegation graph.
+The implementation hashes the server, tool, and sorted scope into an
+`mcp_call:<hash>` ID. A call to another issue, channel, tenant, or query shape
+has a different ID. This prevents a permitted tool from being combined with an
+unrelated target.
+
+The resolver may use semantic or keyword search to find candidate calls. The
+gateway does not. `FilterAuthorizedCandidates` removes candidates the
+requester cannot currently invoke.
+
+## Durable and Contextual Data
+
+Durable OpenFGA data represents application authority:
 
 ```text
-# Existing application authority
-user:alice              can_read       jira_issue:APOLLO-17
-user:alice              can_post       slack_channel:product
-
-# Mission-specific delegation
-agent:triage            executor       mission:apollo-17-product-summary-v1
-jira_issue:APOLLO-17    read_issue     mission:apollo-17-product-summary-v1
-slack_channel:product   post_channel   mission:apollo-17-product-summary-v1
+user:alice                 operator      mcp_server:<work-tracker>
+mcp_server:<work-tracker>  server        mcp_tool:<get-issue>
+mcp_tool:<get-issue>       tool          mcp_call:<apollo-17>
 ```
 
-`model.fga` defines those relations. `tuples.json` holds the durable Jira and
-Slack relationships used by the example.
+After Mission approval, the service issues a signed token. It does not write
+Mission scope to OpenFGA. For every authorization request, the gateway derives
+and supplies these contextual tuples:
+
+```text
+user:alice                 requester     mission:<id>
+agent:triage               executor      mission:<id>
+mcp_call:<apollo-17>       allowed_call  mission:<id>
+```
+
+This avoids one durable write and cleanup cycle per task. It does not make
+Mission state offline: the gateway still reads the Mission control plane to
+enforce immediate revocation and approval changes.
 
 ## Request Flow
 
 ```mermaid
 flowchart LR
-    U[User request] --> I[Intent service]
-    I --> R[Tool and resource resolver]
+    U[User request] --> R[Intent and resource resolver]
     R --> F[OpenFGA candidate filter]
     F --> M[Mission approval]
-    M --> T[Signed Mission token]
-    T --> G[Gateway]
+    M --> T[Signed token]
+    T --> A[Agent runtime]
+    A --> G[Mission gateway]
 
-    J[Jira relationships] --> F
-    S[Slack relationships] --> F
-    J --> G
-    S --> G
-
+    D[Durable OpenFGA source authority] --> F
+    D --> G
     G --> C{All gates pass?}
-    C -->|yes| A[Tool or API call]
-    C -->|no| D[Denied decision]
+    C -->|yes| X[MCP tool invocation]
+    C -->|no| N[Denied decision]
 ```
 
-The resolver may use semantic or keyword search to find candidates. FGA then
-filters the resolved IDs against the requester's current access. FGA is not
-used for natural-language interpretation or permission synchronization.
+The agent runtime submits a token and a canonical call to the gateway. The
+gateway verifies the token, loads the Mission state, builds contextual tuples,
+and checks both durable authority and Mission scope before forwarding the
+request to an MCP adapter.
 
 ## Components
 
 | Component | Responsibility |
 | --- | --- |
-| Intent service and resolver | Interpret the request and produce canonical action/resource candidates. |
-| `FilterAuthorizedCandidates` | Remove candidates the requester cannot currently access. |
-| `MissionService` | Create, approve, revoke, complete, and issue a signed token for Missions. |
-| OpenFGA | Store source relationships and the Mission's explicit action/resource scope. |
-| `Gateway` | Enforce every gate immediately before a downstream call and retain the decision audit log. |
+| Resolver | Maps the user request to canonical calls. |
+| `FilterAuthorizedCandidates` | Filters resolved calls against durable user authority. |
+| `MissionService` | Creates, approves, revokes, completes, and tracks Missions. |
+| `MissionTokenSigner` | Issues and verifies HMAC-signed Mission tokens. |
+| OpenFGA | Evaluates durable application authority plus contextual Mission scope. |
+| `Gateway` | Applies all checks immediately before a downstream tool call and records the decision. |
 
-The included `OpenFGAHTTP` adapter calls OpenFGA's standard Check and Write
-APIs. Tests use an in-memory evaluator that implements only the model in this
-repository; it is not a general OpenFGA evaluator.
+`OpenFGAHTTP` uses the standard OpenFGA Check and Write APIs. The default
+tests use an in-memory evaluator that implements only this repository's model;
+it is not a general OpenFGA evaluator.
 
 ## Run the Demo
 
@@ -120,42 +128,46 @@ go test ./...
 go run ./cmd/demo
 ```
 
-The demo proves the following sequence:
+The demo proves:
 
-| Step | Expected result |
+| Scenario | Expected result |
 | --- | --- |
-| Candidate filtering | `APOLLO-17` remains; an issue Alice cannot read is removed. |
-| Scoped Jira read | Allowed. |
-| Slack post before preview approval | Denied. |
-| Slack post after requester approval | Allowed. |
-| Slack post to a different channel | Denied by Mission scope. |
-| Jira permission revocation | The next read is denied by current base access. |
+| Candidate filtering | A call on an inaccessible MCP server is removed. |
+| Scoped call | The approved read call is allowed. |
+| Approval gate | A side-effect call is denied before requester approval. |
+| Exact scope | The same tool with another target is denied. |
+| Source revocation | Removing requester authority denies the next call. |
+| Contextual scope | Mission scope is never written to the durable graph. |
 
 ## Integration Shape
 
-1. Resolve the user request to canonical resource IDs.
-2. Filter those candidates with `FilterAuthorizedCandidates`.
-3. Create a draft with `CreateMissionInput`, including the requester, agent,
-   grants, expiry, and egress policy.
-4. Have the requester approve the Mission, then give the issued token to the
-   agent runtime.
-5. Call `Gateway.Authorize` before each downstream tool or API invocation.
-6. Revoke or complete the Mission when the work ends. Future calls are denied.
+1. Implement a resolver or `ScopeExtractor` for each MCP tool. It must emit
+   canonical IDs from policy-relevant parameters, not arbitrary raw input.
+2. Store or synchronize the requester's durable application authority in
+   OpenFGA.
+3. Filter resolver candidates with `FilterAuthorizedCandidates`.
+4. Create a draft Mission, obtain requester approval, and issue its token to
+   the agent runtime.
+5. Place `Gateway.Authorize` in front of every MCP tool adapter. Only forward
+   calls with an allowed decision.
+6. Revoke or complete the Mission when work ends. Existing tokens are denied
+   on the next request.
 
 ## Repository Layout
 
 | Path | Purpose |
 | --- | --- |
-| `cmd/demo` | Runnable Jira-to-Slack flow. |
-| `internal/mission` | Mission service, gateway, FGA adapters, and contract tests. |
-| `model.fga` | OpenFGA authorization model. |
-| `tuples.json` | Example Jira and Slack source relationships. |
+| `cmd/demo` | Runnable generic MCP flow. |
+| `internal/mission` | Mission service, contextual gateway, OpenFGA adapters, and tests. |
+| `model.fga` | Generic MCP server, tool, call, and Mission model. |
+| `tuples.json` | Illustrative durable source-authority relationships. |
 
 ## Deliberate Omissions
 
-- Intent classification, embeddings, and resource search.
-- OAuth, SaaS connectors, MCP transport adapters, and permission-sync jobs.
-- Persistence, UI, child Missions, and cross-domain delegation.
+- Intent classification, semantic search, and source permission synchronization.
+- MCP transport and application-specific `ScopeExtractor` implementations.
+- Persistence and distributed Mission state.
+- Delegation chains, child Missions, and cross-domain authority transfer.
 
 ## License
 

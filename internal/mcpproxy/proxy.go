@@ -21,6 +21,11 @@ type Upstream interface {
 	CallTool(context.Context, *mcp.CallToolParams) (*mcp.CallToolResult, error)
 }
 
+// AgentIdentityVerifier returns the authenticated workload identity for an
+// inbound request. It must derive that identity independently of the Mission
+// token, for example from verified mTLS, workload OIDC, or a trusted gateway.
+type AgentIdentityVerifier func(*http.Request) (string, error)
+
 // SessionUpstream forwards calls to a connected MCP client session.
 type SessionUpstream struct {
 	Session *mcp.ClientSession
@@ -112,10 +117,11 @@ func (policy ToolPolicy) validate() error {
 }
 
 type Proxy struct {
-	gateway  *mission.Gateway
-	signer   *mission.MissionTokenSigner
-	upstream Upstream
-	server   *mcp.Server
+	gateway       *mission.Gateway
+	signer        *mission.MissionTokenSigner
+	upstream      Upstream
+	agentIdentity AgentIdentityVerifier
+	server        *mcp.Server
 }
 
 func New(
@@ -123,18 +129,23 @@ func New(
 	signer *mission.MissionTokenSigner,
 	upstream Upstream,
 	policies []ToolPolicy,
+	agentIdentity AgentIdentityVerifier,
 ) (*Proxy, error) {
 	if gateway == nil || signer == nil || upstream == nil {
 		return nil, fmt.Errorf("gateway, signer, and upstream are required")
+	}
+	if agentIdentity == nil {
+		return nil, fmt.Errorf("an independent agent identity verifier is required")
 	}
 	if len(policies) == 0 {
 		return nil, fmt.Errorf("at least one tool policy is required")
 	}
 
 	proxy := &Proxy{
-		gateway:  gateway,
-		signer:   signer,
-		upstream: upstream,
+		gateway:       gateway,
+		signer:        signer,
+		upstream:      upstream,
+		agentIdentity: agentIdentity,
 		server: mcp.NewServer(&mcp.Implementation{
 			Name:    "openfga-mission-gateway",
 			Version: "v0.1.0",
@@ -161,9 +172,9 @@ func New(
 	return proxy, nil
 }
 
-// HTTPHandler serves a Streamable HTTP MCP endpoint protected by Mission
-// bearer tokens. The token is consumed at this boundary and is never sent to
-// the upstream MCP server.
+// HTTPHandler serves a Streamable HTTP MCP endpoint protected by a Mission
+// bearer token and an independent workload identity. The Mission token is
+// consumed at this boundary and is never sent to the upstream MCP server.
 func (proxy *Proxy) HTTPHandler() http.Handler {
 	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
 		return proxy.server
@@ -174,15 +185,23 @@ func (proxy *Proxy) HTTPHandler() http.Handler {
 func (proxy *Proxy) verifyToken(
 	_ context.Context,
 	token string,
-	_ *http.Request,
+	request *http.Request,
 ) (*auth.TokenInfo, error) {
 	claims, err := proxy.signer.Verify(token, time.Now())
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", auth.ErrInvalidToken, err)
 	}
+	agentID, err := proxy.agentIdentity(request)
+	if err != nil {
+		return nil, fmt.Errorf("%w: agent authentication failed: %v", auth.ErrInvalidToken, err)
+	}
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		return nil, fmt.Errorf("%w: agent authentication returned no identity", auth.ErrInvalidToken)
+	}
 	return &auth.TokenInfo{
 		Expiration: time.Unix(claims.ExpiresAt, 0),
-		UserID:     claims.Agent,
+		UserID:     agentID,
 		Extra: map[string]any{
 			"mission_token": token,
 		},

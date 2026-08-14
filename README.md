@@ -24,7 +24,7 @@ The gateway allows a call only when every gate passes:
 | --- | --- | --- |
 | Token validity | HMAC-signed Mission token | Identifies the Mission, agent, version, expiry, and permitted call IDs. |
 | Mission state | Mission service | Makes revocation, completion, and approval changes effective immediately. |
-| Agent binding | Token-derived contextual tuple | Prevents another agent from reusing the token. |
+| Caller binding | Independently authenticated agent identity plus the signed token | Rejects a Mission token presented by a different agent. |
 | Current user authority | Durable OpenFGA relationships | The requester must still be allowed to invoke the canonical call. |
 | Current agent authority | Durable OpenFGA relationships | The agent must still be allowed to invoke the canonical call. |
 | Mission scope | Token-derived contextual tuple | Restricts the agent to an exact permitted call. |
@@ -100,10 +100,11 @@ flowchart LR
     C -->|no| N[Denied decision]
 ```
 
-The agent runtime submits a token and a canonical call to the gateway. The
-gateway verifies the token, loads the Mission state, builds contextual tuples,
-and checks current requester authority, current agent authority, and Mission
-scope before forwarding the request to an MCP adapter.
+The agent runtime submits a Mission token, an independently authenticated agent
+identity, and a canonical call to the gateway. The gateway verifies their
+binding, loads the Mission state, builds contextual tuples, and checks current
+requester authority, current agent authority, and Mission scope before
+forwarding the request to an MCP adapter.
 
 ## Components
 
@@ -140,9 +141,16 @@ ToolPolicy{
 ```
 
 The inbound client supplies the Mission token as an HTTP bearer token. The
-proxy reads the bound agent identity from that verified token, not from MCP
-arguments. It uses separate credentials for the upstream MCP connection and
-never forwards the Mission token.
+proxy also requires an `AgentIdentityVerifier`, which must obtain the caller's
+agent identity independently of that token, such as from verified mTLS,
+workload OIDC, or a trusted authentication gateway. The gateway compares that
+identity with the Mission's bound agent before authorizing a tool call.
+
+A Mission token is a scoped capability, not an agent credential. The tests use
+`X-MCP-Agent-ID` to emulate an identity already verified by a trusted layer;
+do not use a caller-controlled HTTP header as production authentication. The
+proxy uses separate credentials for the upstream MCP connection and never
+forwards the Mission token.
 
 An unknown tool or a tool without a scope extractor is rejected before it can
 reach an upstream server.
@@ -171,6 +179,7 @@ The demo proves:
 | Approval gate | A side-effect call is denied before requester approval. |
 | Exact scope | The same tool with another target is denied. |
 | Source revocation | Removing requester authority denies the next call. |
+| Caller binding | A Mission token presented by another agent is denied. |
 | Agent revocation | Removing agent authority denies the next call. |
 | Contextual scope | Mission scope is never written to the durable graph. |
 
@@ -211,8 +220,9 @@ immediate requester or agent source-access revocation.
 3. Filter resolver candidates with `FilterAuthorizedCandidates`.
 4. Create a draft Mission. Issuance checks both principals' current authority;
    after requester approval, issue its token to the agent runtime.
-5. Place `Gateway.Authorize` in front of every MCP tool adapter. Only forward
-   calls with an allowed decision.
+5. Configure `AgentIdentityVerifier` from independently verified workload
+   identity, then place `Gateway.Authorize` in front of every MCP tool adapter.
+   Only forward calls with an allowed decision.
 6. Revoke or complete the Mission when work ends. Existing tokens are denied
    on the next request.
 

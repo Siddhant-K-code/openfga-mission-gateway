@@ -128,10 +128,7 @@ func TestOpenFGAIntegrationForMCPProxy(t *testing.T) {
 
 	fixture := &upstreamFixture{}
 	upstreamMCP := fixture.server()
-	upstreamServer := httptest.NewServer(mcp.NewStreamableHTTPHandler(
-		func(*http.Request) *mcp.Server { return upstreamMCP },
-		&mcp.StreamableHTTPOptions{JSONResponse: true},
-	))
+	upstreamServer := httptest.NewServer(fixture.streamableHandler(upstreamMCP))
 	defer upstreamServer.Close()
 	upstreamSession := connectClient(t, ctx, upstreamServer.URL, http.DefaultClient)
 	defer upstreamSession.Close()
@@ -153,13 +150,13 @@ func TestOpenFGAIntegrationForMCPProxy(t *testing.T) {
 			InputSchema:  requiredStringSchema("channel_id"),
 			ExtractScope: RequiredStringScope(map[string]string{"channel_id": "channel_id"}),
 		},
-	})
+	}, testAgentIdentity)
 	if err != nil {
 		t.Fatal(err)
 	}
 	proxyServer := httptest.NewServer(proxy.HTTPHandler())
 	defer proxyServer.Close()
-	client := connectClient(t, ctx, proxyServer.URL, bearerClient(token))
+	client := connectClient(t, ctx, proxyServer.URL, bearerClient(token, "agent:triage"))
 	defer client.Close()
 
 	allowed, err := client.CallTool(ctx, &mcp.CallToolParams{
@@ -173,6 +170,27 @@ func TestOpenFGAIntegrationForMCPProxy(t *testing.T) {
 	}
 	if allowed.IsError || fixture.callCount("get_issue") != 1 {
 		t.Fatalf("live OpenFGA allowed result = %+v, upstream calls = %d", allowed, fixture.callCount("get_issue"))
+	}
+	if !fixture.allInboundAuthorizationEmpty() {
+		t.Fatal("Mission bearer token was forwarded to the live upstream MCP fixture")
+	}
+
+	wrongAgent := connectClient(t, ctx, proxyServer.URL, bearerClient(token, "agent:other"))
+	defer wrongAgent.Close()
+	wrongAgentResult, err := wrongAgent.CallTool(ctx, &mcp.CallToolParams{
+		Name: "work.get_issue",
+		Arguments: map[string]any{
+			"issue_id": "APOLLO-17",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !wrongAgentResult.IsError || resultText(wrongAgentResult) != "denied: Mission token is not bound to this agent" {
+		t.Fatalf("live OpenFGA wrong agent result = %+v", wrongAgentResult)
+	}
+	if fixture.callCount("get_issue") != 1 {
+		t.Fatalf("wrong agent call reached upstream %d times", fixture.callCount("get_issue"))
 	}
 
 	denied, err := client.CallTool(ctx, &mcp.CallToolParams{

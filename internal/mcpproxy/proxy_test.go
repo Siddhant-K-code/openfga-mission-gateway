@@ -18,10 +18,7 @@ func TestProxyForwardsOnlyAuthorizedMCPCalls(t *testing.T) {
 	ctx := context.Background()
 	fixture := &upstreamFixture{}
 	upstreamMCP := fixture.server()
-	upstreamServer := httptest.NewServer(mcp.NewStreamableHTTPHandler(
-		func(*http.Request) *mcp.Server { return upstreamMCP },
-		&mcp.StreamableHTTPOptions{JSONResponse: true},
-	))
+	upstreamServer := httptest.NewServer(fixture.streamableHandler(upstreamMCP))
 	defer upstreamServer.Close()
 
 	upstreamSession := connectClient(t, ctx, upstreamServer.URL, http.DefaultClient)
@@ -31,7 +28,7 @@ func TestProxyForwardsOnlyAuthorizedMCPCalls(t *testing.T) {
 	proxyServer := httptest.NewServer(proxy.HTTPHandler())
 	defer proxyServer.Close()
 
-	client := connectClient(t, ctx, proxyServer.URL, bearerClient(token))
+	client := connectClient(t, ctx, proxyServer.URL, bearerClient(token, "agent:triage"))
 	defer client.Close()
 
 	tools, err := client.ListTools(ctx, nil)
@@ -56,6 +53,27 @@ func TestProxyForwardsOnlyAuthorizedMCPCalls(t *testing.T) {
 	}
 	if got := fixture.callCount("get_issue"); got != 1 {
 		t.Fatalf("get_issue upstream calls = %d, want 1", got)
+	}
+	if !fixture.allInboundAuthorizationEmpty() {
+		t.Fatal("Mission bearer token was forwarded to the upstream MCP server")
+	}
+
+	wrongAgent := connectClient(t, ctx, proxyServer.URL, bearerClient(token, "agent:other"))
+	defer wrongAgent.Close()
+	wrongAgentResult, err := wrongAgent.CallTool(ctx, &mcp.CallToolParams{
+		Name: "work.get_issue",
+		Arguments: map[string]any{
+			"issue_id": "APOLLO-17",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !wrongAgentResult.IsError || resultText(wrongAgentResult) != "denied: Mission token is not bound to this agent" {
+		t.Fatalf("wrong agent result = %+v", wrongAgentResult)
+	}
+	if got := fixture.callCount("get_issue"); got != 1 {
+		t.Fatalf("wrong agent call reached upstream %d times", got)
 	}
 
 	blockedPost, err := client.CallTool(ctx, &mcp.CallToolParams{
@@ -214,7 +232,7 @@ func newProxyEnvironment(t *testing.T, upstream Upstream) (*Proxy, *mission.Miss
 			InputSchema:  requiredStringSchema("channel_id"),
 			ExtractScope: RequiredStringScope(map[string]string{"channel_id": "channel_id"}),
 		},
-	})
+	}, testAgentIdentity)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -286,12 +304,14 @@ func requiredStringSchema(name string) map[string]any {
 
 type bearerRoundTripper struct {
 	token string
+	agent string
 	base  http.RoundTripper
 }
 
-func bearerClient(token string) *http.Client {
+func bearerClient(token, agent string) *http.Client {
 	return &http.Client{Transport: bearerRoundTripper{
 		token: token,
+		agent: agent,
 		base:  http.DefaultTransport,
 	}}
 }
@@ -300,12 +320,30 @@ func (transport bearerRoundTripper) RoundTrip(request *http.Request) (*http.Resp
 	copy := request.Clone(request.Context())
 	copy.Header = request.Header.Clone()
 	copy.Header.Set("Authorization", "Bearer "+transport.token)
+	copy.Header.Set("X-MCP-Agent-ID", transport.agent)
 	return transport.base.RoundTrip(copy)
 }
 
+// testAgentIdentity models a trusted authentication layer that has already
+// verified a workload credential and supplies the principal to this proxy.
+// A raw HTTP header alone is not suitable for production authentication.
+func testAgentIdentity(request *http.Request) (string, error) {
+	return request.Header.Get("X-MCP-Agent-ID"), nil
+}
+
 type upstreamFixture struct {
-	mu    sync.Mutex
-	calls []string
+	mu             sync.Mutex
+	calls          []string
+	authorizations []string
+}
+
+func (fixture *upstreamFixture) streamableHandler(server *mcp.Server) http.Handler {
+	return mcp.NewStreamableHTTPHandler(func(request *http.Request) *mcp.Server {
+		fixture.mu.Lock()
+		fixture.authorizations = append(fixture.authorizations, request.Header.Get("Authorization"))
+		fixture.mu.Unlock()
+		return server
+	}, &mcp.StreamableHTTPOptions{JSONResponse: true})
 }
 
 func (fixture *upstreamFixture) server() *mcp.Server {
@@ -338,6 +376,17 @@ func (fixture *upstreamFixture) callCount(name string) int {
 		}
 	}
 	return count
+}
+
+func (fixture *upstreamFixture) allInboundAuthorizationEmpty() bool {
+	fixture.mu.Lock()
+	defer fixture.mu.Unlock()
+	for _, authorization := range fixture.authorizations {
+		if authorization != "" {
+			return false
+		}
+	}
+	return true
 }
 
 func resultText(result *mcp.CallToolResult) string {
@@ -380,6 +429,21 @@ func TestProxyRejectsInvalidBearerToken(t *testing.T) {
 	}
 }
 
+func TestProxyRejectsMissionTokenWithoutAgentIdentity(t *testing.T) {
+	proxy, _, token := newProxyEnvironment(t, upstreamStub{})
+	server := httptest.NewServer(proxy.HTTPHandler())
+	defer server.Close()
+
+	response, err := bearerClient(token, "").Post(server.URL, "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", response.StatusCode, http.StatusUnauthorized)
+	}
+}
+
 type upstreamStub struct{}
 
 func (upstreamStub) CallTool(context.Context, *mcp.CallToolParams) (*mcp.CallToolResult, error) {
@@ -402,13 +466,15 @@ func TestToolPolicyRejectsInvalidArguments(t *testing.T) {
 
 func TestBearerRoundTripperAddsAuthorization(t *testing.T) {
 	var received string
+	var receivedAgent string
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		received = request.Header.Get("Authorization")
+		receivedAgent = request.Header.Get("X-MCP-Agent-ID")
 		_, _ = writer.Write([]byte("ok"))
 	}))
 	defer server.Close()
 
-	response, err := bearerClient("token").Get(server.URL)
+	response, err := bearerClient("token", "agent:triage").Get(server.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -416,15 +482,15 @@ func TestBearerRoundTripperAddsAuthorization(t *testing.T) {
 	if received != "Bearer token" {
 		t.Fatalf("authorization = %q", received)
 	}
+	if receivedAgent != "agent:triage" {
+		t.Fatalf("agent identity = %q", receivedAgent)
+	}
 }
 
 func TestFixtureReturnsJSONResult(t *testing.T) {
 	fixture := &upstreamFixture{}
 	upstreamMCP := fixture.server()
-	server := httptest.NewServer(mcp.NewStreamableHTTPHandler(
-		func(*http.Request) *mcp.Server { return upstreamMCP },
-		&mcp.StreamableHTTPOptions{JSONResponse: true},
-	))
+	server := httptest.NewServer(fixture.streamableHandler(upstreamMCP))
 	defer server.Close()
 
 	client := connectClient(t, context.Background(), server.URL, http.DefaultClient)

@@ -54,9 +54,11 @@ func TestOpenFGAIntegrationForMCPProxy(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		tuples = append(tuples, mission.TupleKey{
-			User: "user:alice", Relation: "operator", Object: serverID,
-		})
+		for _, principal := range []string{"user:alice", "agent:triage"} {
+			tuples = append(tuples, mission.TupleKey{
+				User: principal, Relation: "operator", Object: serverID,
+			})
+		}
 	}
 	tuples = uniqueTuples(tuples)
 	if err := fga.Write(ctx, tuples); err != nil {
@@ -67,6 +69,39 @@ func TestOpenFGAIntegrationForMCPProxy(t *testing.T) {
 			t.Logf("cleanup OpenFGA tuples: %v", err)
 		}
 	})
+	readServerID, err := readCall.ServerID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentReadAuthority := mission.TupleKey{
+		User: "agent:triage", Relation: "operator", Object: readServerID,
+	}
+	if err := fga.Delete(ctx, []mission.TupleKey{agentReadAuthority}); err != nil {
+		t.Fatal(err)
+	}
+	issuanceSigner, err := mission.NewMissionTokenSigner([]byte("mcp-proxy-agent-issuance-secret-32"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	issuanceMissions := mission.NewMissionService(fga, issuanceSigner)
+	_, err = issuanceMissions.CreateDraft(mission.CreateMissionInput{
+		MissionID: "mcp-live-agent-issuance-denied",
+		Requester: "user:alice",
+		Agent:     "agent:triage",
+		Intent: mission.IntentProposal{Grants: []mission.CallGrant{{
+			Call: readCall,
+		}}},
+		ExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := issuanceMissions.Approve(ctx, "mcp-live-agent-issuance-denied", "user:alice", time.Now()); err == nil || !strings.Contains(err.Error(), "agent agent:triage cannot invoke") {
+		t.Fatalf("agent authority issuance error = %v", err)
+	}
+	if err := fga.Write(ctx, []mission.TupleKey{agentReadAuthority}); err != nil {
+		t.Fatal(err)
+	}
 
 	signer, err := mission.NewMissionTokenSigner([]byte("mcp-proxy-live-fga-secret-32-bytes"))
 	if err != nil {
@@ -156,8 +191,29 @@ func TestOpenFGAIntegrationForMCPProxy(t *testing.T) {
 		t.Fatalf("denied call reached upstream %d times", fixture.callCount("post_message"))
 	}
 
-	readServerID, err := readCall.ServerID()
+	if err := fga.Delete(ctx, []mission.TupleKey{{
+		User: "agent:triage", Relation: "operator", Object: readServerID,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	deniedAfterAgentRevoke, err := client.CallTool(ctx, &mcp.CallToolParams{
+		Name: "work.get_issue",
+		Arguments: map[string]any{
+			"issue_id": "APOLLO-17",
+		},
+	})
 	if err != nil {
+		t.Fatal(err)
+	}
+	if !deniedAfterAgentRevoke.IsError || resultText(deniedAfterAgentRevoke) != "denied: denied by agent_base_access" {
+		t.Fatalf("live OpenFGA agent revocation denial = %+v", deniedAfterAgentRevoke)
+	}
+	if fixture.callCount("get_issue") != 1 {
+		t.Fatalf("agent-revoked call reached upstream %d times", fixture.callCount("get_issue"))
+	}
+	if err := fga.Write(ctx, []mission.TupleKey{{
+		User: "agent:triage", Relation: "operator", Object: readServerID,
+	}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := fga.Delete(ctx, []mission.TupleKey{{

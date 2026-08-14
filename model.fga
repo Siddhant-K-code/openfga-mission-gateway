@@ -10,12 +10,12 @@ type agent
 
 type mcp_server
   relations
-    define operator: [user]
+    define operator: [user, agent]
 
 type mcp_tool
   relations
     define server: [mcp_server]
-    define invoker: [user] or operator from server
+    define invoker: [user, agent] or operator from server
     define can_invoke: invoker
 
 type mcp_call
@@ -23,7 +23,7 @@ type mcp_call
     # A canonical call captures server, tool, and the policy-relevant part of
     # the input. It can inherit tool access or receive a direct user grant.
     define tool: [mcp_tool]
-    define invoker: [user] or can_invoke from tool
+    define invoker: [user, agent] or can_invoke from tool
     define can_invoke: invoker
 
 type mission

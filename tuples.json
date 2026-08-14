@@ -7,6 +7,11 @@
         "object": "mcp_server:work-tracker"
       },
       {
+        "user": "agent:triage",
+        "relation": "operator",
+        "object": "mcp_server:work-tracker"
+      },
+      {
         "user": "mcp_server:work-tracker",
         "relation": "server",
         "object": "mcp_tool:get-issue"

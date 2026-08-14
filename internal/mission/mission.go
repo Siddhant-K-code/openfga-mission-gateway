@@ -673,7 +673,7 @@ func (service *MissionService) Approve(
 	if !mission.ExpiresAt.After(now) {
 		return "", fmt.Errorf("cannot approve an expired Mission")
 	}
-	if err := service.validateBaseAccess(ctx, mission); err != nil {
+	if err := service.validateCurrentAuthority(ctx, mission); err != nil {
 		return "", err
 	}
 
@@ -776,23 +776,32 @@ func (service *MissionService) getLocked(missionID string) (*Mission, error) {
 	return mission, nil
 }
 
-func (service *MissionService) validateBaseAccess(
+func (service *MissionService) validateCurrentAuthority(
 	ctx context.Context,
 	mission *Mission,
 ) error {
 	for _, callID := range mission.CallIDs() {
-		allowed, err := service.fga.Check(ctx, CheckRequest{
-			User: mission.Requester, Relation: "can_invoke", Object: callID,
-		})
-		if err != nil {
-			return err
-		}
-		if !allowed {
-			return fmt.Errorf(
-				"%s cannot invoke %s; Mission cannot delegate it",
-				mission.Requester,
-				callID,
-			)
+		for _, principal := range []struct {
+			name string
+			id   string
+		}{
+			{name: "requester", id: mission.Requester},
+			{name: "agent", id: mission.Agent},
+		} {
+			allowed, err := service.fga.Check(ctx, CheckRequest{
+				User: principal.id, Relation: "can_invoke", Object: callID,
+			})
+			if err != nil {
+				return err
+			}
+			if !allowed {
+				return fmt.Errorf(
+					"%s %s cannot invoke %s; Mission cannot delegate it",
+					principal.name,
+					principal.id,
+					callID,
+				)
+			}
 		}
 	}
 	return nil
@@ -915,6 +924,15 @@ func (gateway *Gateway) Authorize(
 	if err != nil {
 		return gateway.record(false, "authorization check failed", mission, nil, now)
 	}
+	agentAccess, err := gateway.fga.Check(ctx, CheckRequest{
+		User:             request.Agent,
+		Relation:         "can_invoke",
+		Object:           callID,
+		ContextualTuples: contextualTuples,
+	})
+	if err != nil {
+		return gateway.record(false, "authorization check failed", mission, nil, now)
+	}
 	agentBound, err := gateway.fga.Check(ctx, CheckRequest{
 		User:             request.Agent,
 		Relation:         "executor",
@@ -936,6 +954,7 @@ func (gateway *Gateway) Authorize(
 
 	checks := []CheckResult{
 		{Name: "requester_base_access", Allowed: baseAccess},
+		{Name: "agent_base_access", Allowed: agentAccess},
 		{Name: "agent_bound_to_mission", Allowed: agentBound},
 		{Name: "mission_call_scope", Allowed: missionScope},
 	}
@@ -1094,6 +1113,8 @@ func DemoEnvironment(
 	durableTuples = append(durableTuples,
 		TupleKey{User: "user:alice", Relation: "operator", Object: workTrackerID},
 		TupleKey{User: "user:alice", Relation: "operator", Object: teamChatID},
+		TupleKey{User: "agent:triage", Relation: "operator", Object: workTrackerID},
+		TupleKey{User: "agent:triage", Relation: "operator", Object: teamChatID},
 	)
 	fga := NewInMemoryFGA(durableTuples)
 

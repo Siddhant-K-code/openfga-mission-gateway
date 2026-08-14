@@ -167,9 +167,11 @@ func newProxyEnvironment(t *testing.T, upstream Upstream) (*Proxy, *mission.Miss
 		if err != nil {
 			t.Fatal(err)
 		}
-		tuples = append(tuples, mission.TupleKey{
-			User: "user:alice", Relation: "operator", Object: serverID,
-		})
+		for _, principal := range []string{"user:alice", "agent:triage"} {
+			tuples = append(tuples, mission.TupleKey{
+				User: principal, Relation: "operator", Object: serverID,
+			})
+		}
 	}
 	tuples = uniqueTuples(tuples)
 	fga := mission.NewInMemoryFGA(tuples)

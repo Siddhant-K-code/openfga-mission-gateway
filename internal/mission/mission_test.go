@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -170,6 +171,25 @@ func TestGateway(t *testing.T) {
 		assertDenied(t, decision, "denied by requester_base_access")
 	})
 
+	t.Run("denies after agent authority is revoked", func(t *testing.T) {
+		fga, _, gateway, token, calls, err := DemoEnvironment(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		serverID, err := calls.ReadIssue.ServerID()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := fga.Delete(ctx, []TupleKey{{
+			User: "agent:triage", Relation: "operator", Object: serverID,
+		}}); err != nil {
+			t.Fatal(err)
+		}
+
+		decision := authorize(ctx, gateway, token, calls.ReadIssue, "agent:triage", time.Now())
+		assertDenied(t, decision, "denied by agent_base_access")
+	})
+
 	t.Run("denies after Mission revocation", func(t *testing.T) {
 		_, missions, gateway, token, calls, err := DemoEnvironment(ctx)
 		if err != nil {
@@ -200,6 +220,45 @@ func TestGateway(t *testing.T) {
 		decision := authorize(ctx, gateway, token, calls.ReadIssue, "agent:triage", time.Now().Add(2*time.Hour))
 		assertDenied(t, decision, "Mission token expired")
 	})
+}
+
+func TestMissionApprovalRequiresAgentAuthority(t *testing.T) {
+	ctx := context.Background()
+	fga, _, _, _, calls, err := DemoEnvironment(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverID, err := calls.ReadIssue.ServerID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fga.Delete(ctx, []TupleKey{{
+		User: "agent:triage", Relation: "operator", Object: serverID,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	signer, err := NewMissionTokenSigner([]byte("agent-authority-test-secret-32-bytes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	missions := NewMissionService(fga, signer)
+	_, err = missions.CreateDraft(CreateMissionInput{
+		MissionID: "agent-authority-required",
+		Requester: "user:alice",
+		Agent:     "agent:triage",
+		Intent: IntentProposal{Grants: []CallGrant{{
+			Call: calls.ReadIssue,
+		}}},
+		ExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = missions.Approve(ctx, "agent-authority-required", "user:alice", time.Now())
+	if err == nil || !strings.Contains(err.Error(), "agent agent:triage cannot invoke") {
+		t.Fatalf("approval error = %v", err)
+	}
 }
 
 func TestOpenFGAHTTPIncludesContextualTuples(t *testing.T) {

@@ -26,6 +26,7 @@ The gateway allows a call only when every gate passes:
 | Mission state | Mission service | Makes revocation, completion, and approval changes effective immediately. |
 | Agent binding | Token-derived contextual tuple | Prevents another agent from reusing the token. |
 | Current user authority | Durable OpenFGA relationships | The requester must still be allowed to invoke the canonical call. |
+| Current agent authority | Durable OpenFGA relationships | The agent must still be allowed to invoke the canonical call. |
 | Mission scope | Token-derived contextual tuple | Restricts the agent to an exact permitted call. |
 | Output approval | Mission service | Requires requester approval before a configured side effect. |
 
@@ -62,6 +63,7 @@ Durable OpenFGA data represents application authority:
 
 ```text
 user:alice                 operator      mcp_server:<work-tracker>
+agent:triage               operator      mcp_server:<work-tracker>
 mcp_server:<work-tracker>  server        mcp_tool:<get-issue>
 mcp_tool:<get-issue>       tool          mcp_call:<apollo-17>
 ```
@@ -100,8 +102,8 @@ flowchart LR
 
 The agent runtime submits a token and a canonical call to the gateway. The
 gateway verifies the token, loads the Mission state, builds contextual tuples,
-and checks both durable authority and Mission scope before forwarding the
-request to an MCP adapter.
+and checks current requester authority, current agent authority, and Mission
+scope before forwarding the request to an MCP adapter.
 
 ## Components
 
@@ -111,7 +113,7 @@ request to an MCP adapter.
 | `FilterAuthorizedCandidates` | Filters resolved calls against durable user authority. |
 | `MissionService` | Creates, approves, revokes, completes, and tracks Missions. |
 | `MissionTokenSigner` | Issues and verifies HMAC-signed Mission tokens. |
-| OpenFGA | Evaluates durable application authority plus contextual Mission scope. |
+| OpenFGA | Evaluates durable requester/agent authority plus contextual Mission scope. |
 | `Gateway` | Applies all checks immediately before a downstream tool call and records the decision. |
 | `mcpproxy.Proxy` | Authenticates an inbound MCP client, derives a canonical call, authorizes it, then forwards it to an upstream MCP server. |
 
@@ -169,6 +171,7 @@ The demo proves:
 | Approval gate | A side-effect call is denied before requester approval. |
 | Exact scope | The same tool with another target is denied. |
 | Source revocation | Removing requester authority denies the next call. |
+| Agent revocation | Removing agent authority denies the next call. |
 | Contextual scope | Mission scope is never written to the durable graph. |
 
 ## Test the Live Path
@@ -195,18 +198,19 @@ make integration
 ```
 
 The integration test creates its durable tuples in the supplied store and
-deletes them when complete. It covers allowed forwarding, exact call scope,
-and immediate source-access revocation.
+deletes them when complete. It verifies that token issuance fails without
+agent authority, then covers allowed forwarding, exact call scope, and
+immediate requester or agent source-access revocation.
 
 ## Integration Shape
 
 1. Implement a resolver or `ScopeExtractor` for each MCP tool. It must emit
    canonical IDs from policy-relevant parameters, not arbitrary raw input.
-2. Store or synchronize the requester's durable application authority in
-   OpenFGA.
+2. Store or synchronize both requester and agent durable application authority
+   in OpenFGA.
 3. Filter resolver candidates with `FilterAuthorizedCandidates`.
-4. Create a draft Mission, obtain requester approval, and issue its token to
-   the agent runtime.
+4. Create a draft Mission. Issuance checks both principals' current authority;
+   after requester approval, issue its token to the agent runtime.
 5. Place `Gateway.Authorize` in front of every MCP tool adapter. Only forward
    calls with an allowed decision.
 6. Revoke or complete the Mission when work ends. Existing tokens are denied

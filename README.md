@@ -1,6 +1,7 @@
 # OpenFGA Mission Gateway
 
-Reference Go implementation of a policy enforcement point for MCP tool calls.
+Reference Go implementation of a policy enforcement point and MCP proxy for
+MCP tool calls.
 A Mission gives one agent a short-lived, explicit set of canonical calls. The
 gateway evaluates that authority before it invokes an MCP tool.
 
@@ -112,14 +113,45 @@ request to an MCP adapter.
 | `MissionTokenSigner` | Issues and verifies HMAC-signed Mission tokens. |
 | OpenFGA | Evaluates durable application authority plus contextual Mission scope. |
 | `Gateway` | Applies all checks immediately before a downstream tool call and records the decision. |
+| `mcpproxy.Proxy` | Authenticates an inbound MCP client, derives a canonical call, authorizes it, then forwards it to an upstream MCP server. |
 
 `OpenFGAHTTP` uses the standard OpenFGA Check and Write APIs. The default
 tests use an in-memory evaluator that implements only this repository's model;
 it is not a general OpenFGA evaluator.
 
+## MCP Proxy
+
+`internal/mcpproxy` uses the official Go MCP SDK over Streamable HTTP. It
+exposes only configured tools. Each `ToolPolicy` maps a public MCP tool to an
+upstream tool and supplies a `ScopeExtractor` for the arguments that matter to
+authorization.
+
+```go
+ToolPolicy{
+    GatewayTool:  "work.get_issue",
+    UpstreamTool: "get_issue",
+    Server:       "work-tracker",
+    ExtractScope: RequiredStringScope(map[string]string{
+        "issue_id": "issue_id",
+    }),
+}
+```
+
+The inbound client supplies the Mission token as an HTTP bearer token. The
+proxy reads the bound agent identity from that verified token, not from MCP
+arguments. It uses separate credentials for the upstream MCP connection and
+never forwards the Mission token.
+
+An unknown tool or a tool without a scope extractor is rejected before it can
+reach an upstream server.
+
+The proxy is ready to embed in an MCP service. The included Mission control
+plane is intentionally in-memory; a multi-process deployment needs persistent
+Mission state before it mints or revokes production tokens.
+
 ## Run the Demo
 
-Requires Go 1.23+.
+Requires Go 1.25+.
 
 ```sh
 git clone https://github.com/Siddhant-K-code/openfga-mission-gateway.git
@@ -138,6 +170,33 @@ The demo proves:
 | Exact scope | The same tool with another target is denied. |
 | Source revocation | Removing requester authority denies the next call. |
 | Contextual scope | Mission scope is never written to the durable graph. |
+
+## Test the Live Path
+
+The default test suite uses an in-memory FGA evaluator plus real Streamable
+HTTP MCP client/server sessions. The integration test uses a live OpenFGA
+server and a real MCP fixture; a denied MCP call is asserted never to reach the
+upstream fixture.
+
+Start OpenFGA locally:
+
+```sh
+openfga run --playground-enabled=false
+```
+
+Create a fresh store and upload the model with the OpenFGA CLI:
+
+```sh
+export FGA_API_URL=http://127.0.0.1:8080
+store_json="$(fga store create --name mission-gateway-e2e --model model.fga)"
+export FGA_STORE_ID="$(printf '%s' "$store_json" | jq -r '.store.id')"
+export FGA_MODEL_ID="$(printf '%s' "$store_json" | jq -r '.model.authorization_model_id')"
+make integration
+```
+
+The integration test creates its durable tuples in the supplied store and
+deletes them when complete. It covers allowed forwarding, exact call scope,
+and immediate source-access revocation.
 
 ## Integration Shape
 
@@ -159,6 +218,7 @@ The demo proves:
 | --- | --- |
 | `cmd/demo` | Runnable generic MCP flow. |
 | `internal/mission` | Mission service, contextual gateway, OpenFGA adapters, and tests. |
+| `internal/mcpproxy` | Streamable HTTP MCP proxy, live MCP fixture test, and optional OpenFGA integration test. |
 | `model.fga` | Generic MCP server, tool, call, and Mission model. |
 | `tuples.json` | Illustrative durable source-authority relationships. |
 

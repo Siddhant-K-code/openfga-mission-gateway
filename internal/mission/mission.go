@@ -453,7 +453,7 @@ type MissionTokenSigner struct {
 	secret []byte
 }
 
-type missionTokenClaims struct {
+type MissionTokenClaims struct {
 	MissionID string   `json:"mission_id"`
 	Agent     string   `json:"agent"`
 	Version   int      `json:"version"`
@@ -477,7 +477,7 @@ func NewRandomMissionTokenSigner() (*MissionTokenSigner, error) {
 }
 
 func (signer *MissionTokenSigner) Issue(mission *Mission) (string, error) {
-	claims := missionTokenClaims{
+	claims := MissionTokenClaims{
 		MissionID: mission.ID,
 		Agent:     mission.Agent,
 		Version:   mission.Version,
@@ -496,32 +496,32 @@ func (signer *MissionTokenSigner) Issue(mission *Mission) (string, error) {
 func (signer *MissionTokenSigner) Verify(
 	token string,
 	now time.Time,
-) (missionTokenClaims, error) {
+) (MissionTokenClaims, error) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 2 {
-		return missionTokenClaims{}, fmt.Errorf("invalid Mission token format")
+		return MissionTokenClaims{}, fmt.Errorf("invalid Mission token format")
 	}
 	signature, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return missionTokenClaims{}, fmt.Errorf("invalid Mission token signature")
+		return MissionTokenClaims{}, fmt.Errorf("invalid Mission token signature")
 	}
 	if !hmac.Equal(signer.sign(parts[0]), signature) {
-		return missionTokenClaims{}, fmt.Errorf("invalid Mission token signature")
+		return MissionTokenClaims{}, fmt.Errorf("invalid Mission token signature")
 	}
 
 	payload, err := base64.RawURLEncoding.DecodeString(parts[0])
 	if err != nil {
-		return missionTokenClaims{}, fmt.Errorf("invalid Mission token payload")
+		return MissionTokenClaims{}, fmt.Errorf("invalid Mission token payload")
 	}
-	var claims missionTokenClaims
+	var claims MissionTokenClaims
 	if err := json.Unmarshal(payload, &claims); err != nil {
-		return missionTokenClaims{}, fmt.Errorf("invalid Mission token payload")
+		return MissionTokenClaims{}, fmt.Errorf("invalid Mission token payload")
 	}
 	if claims.MissionID == "" || claims.Agent == "" || claims.Version < 1 || len(claims.CallIDs) == 0 {
-		return missionTokenClaims{}, fmt.Errorf("invalid Mission token claims")
+		return MissionTokenClaims{}, fmt.Errorf("invalid Mission token claims")
 	}
 	if claims.ExpiresAt <= now.Unix() {
-		return missionTokenClaims{}, fmt.Errorf("Mission token expired")
+		return MissionTokenClaims{}, fmt.Errorf("Mission token expired")
 	}
 	return claims, nil
 }
@@ -973,7 +973,7 @@ func (gateway *Gateway) Authorize(
 
 func missionContextualTuples(
 	mission *Mission,
-	claims missionTokenClaims,
+	claims MissionTokenClaims,
 ) []TupleKey {
 	context := make([]TupleKey, 0, len(claims.CallIDs)+2)
 	missionObject := "mission:" + mission.ID

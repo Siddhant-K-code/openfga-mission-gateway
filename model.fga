@@ -1,8 +1,9 @@
 model
   schema 1.1
 
-# Durable authority lives in this graph. A Mission token contributes its
-# executor and allowed_call relationships as contextual tuples for one Check.
+# Durable authority lives in this graph. The gateway contributes its trusted
+# tool-to-call topology plus a Mission token's executor and allowed_call
+# relationships as contextual tuples for one Check.
 
 type user
 
@@ -25,6 +26,20 @@ type mcp_call
     define tool: [mcp_tool]
     define invoker: [user, agent] or can_invoke from tool
     define can_invoke: invoker
+
+# A project-tracker connector maps tool arguments to these application
+# resources. The generic gateway receives only the relation/object checks.
+type tracker_project
+  relations
+    define member: [user, agent]
+    define viewer: member
+    define can_read: viewer
+
+type tracker_ticket
+  relations
+    define project: [tracker_project]
+    define viewer: [user, agent] or viewer from project
+    define can_read: viewer
 
 type mission
   relations

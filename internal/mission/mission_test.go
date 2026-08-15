@@ -15,11 +15,19 @@ func TestMCPCallIDIsStableForEquivalentScope(t *testing.T) {
 		Server: "work-tracker",
 		Tool:   "get_issue",
 		Scope:  map[string]string{"issue_id": "APOLLO-17", "workspace": "acme"},
+		Requirements: []ResourceRequirement{
+			{Relation: "can_read", Object: "tracker_ticket:APOLLO-17"},
+			{Relation: "can_read", Object: "tracker_project:apollo"},
+		},
 	}
 	right := MCPCall{
 		Server: "work-tracker",
 		Tool:   "get_issue",
 		Scope:  map[string]string{"workspace": "acme", "issue_id": "APOLLO-17"},
+		Requirements: []ResourceRequirement{
+			{Relation: "can_read", Object: "tracker_project:apollo"},
+			{Relation: "can_read", Object: "tracker_ticket:APOLLO-17"},
+		},
 	}
 
 	leftID, err := left.ID()
@@ -32,6 +40,20 @@ func TestMCPCallIDIsStableForEquivalentScope(t *testing.T) {
 	}
 	if leftID != rightID {
 		t.Fatalf("equivalent calls have different IDs: %q != %q", leftID, rightID)
+	}
+}
+
+func TestMCPCallRejectsDuplicateResourceRequirements(t *testing.T) {
+	_, err := (MCPCall{
+		Server: "work-tracker",
+		Tool:   "get_issue",
+		Requirements: []ResourceRequirement{
+			{Relation: "can_read", Object: "tracker_ticket:APOLLO-17"},
+			{Relation: "can_read", Object: "tracker_ticket:APOLLO-17"},
+		},
+	}).ID()
+	if err == nil {
+		t.Fatal("duplicate resource requirements were accepted")
 	}
 }
 
@@ -93,6 +115,39 @@ func TestMissionScopeIsContextual(t *testing.T) {
 	}, time.Now())
 	if !decision.Allowed {
 		t.Fatalf("contextual Mission scope was not enforced: %+v", decision)
+	}
+}
+
+func TestCanonicalCallTopologyIsContextual(t *testing.T) {
+	fga, _, _, _, calls, err := DemoEnvironment(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	callID, err := calls.ReadIssue.ID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	toolID, err := calls.ReadIssue.ToolID()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	persisted, err := fga.Check(context.Background(), CheckRequest{
+		User: toolID, Relation: "tool", Object: callID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted {
+		t.Fatal("resource-specific MCP call topology must not be durable")
+	}
+
+	allowed, err := CanInvokeCall(context.Background(), fga, "user:alice", calls.ReadIssue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !allowed {
+		t.Fatal("trusted contextual tool topology did not authorize the call")
 	}
 }
 

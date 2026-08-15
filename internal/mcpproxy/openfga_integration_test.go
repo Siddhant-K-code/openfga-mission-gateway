@@ -35,6 +35,10 @@ func TestOpenFGAIntegrationForMCPProxy(t *testing.T) {
 		Server: "work-tracker",
 		Tool:   "get_issue",
 		Scope:  map[string]string{"issue_id": "APOLLO-17"},
+		Requirements: []mission.ResourceRequirement{{
+			Relation: "can_read",
+			Object:   "tracker_ticket:APOLLO-17",
+		}},
 	}
 	postCall := mission.MCPCall{
 		Server: "team-chat",
@@ -49,6 +53,11 @@ func TestOpenFGAIntegrationForMCPProxy(t *testing.T) {
 
 	tuples := append(durableTuples(t, readCall), durableTuples(t, postCall)...)
 	tuples = append(tuples, durableTuples(t, otherTarget)...)
+	tuples = append(tuples,
+		mission.TupleKey{User: "tracker_project:apollo", Relation: "project", Object: "tracker_ticket:APOLLO-17"},
+		mission.TupleKey{User: "user:alice", Relation: "member", Object: "tracker_project:apollo"},
+		mission.TupleKey{User: "agent:triage", Relation: "member", Object: "tracker_project:apollo"},
+	)
 	for _, call := range []mission.MCPCall{readCall, postCall, otherTarget} {
 		serverID, err := call.ServerID()
 		if err != nil {
@@ -135,12 +144,13 @@ func TestOpenFGAIntegrationForMCPProxy(t *testing.T) {
 
 	proxy, err := New(mission.NewGateway(fga, missions, signer), signer, SessionUpstream{Session: upstreamSession}, []ToolPolicy{
 		{
-			GatewayTool:  "work.get_issue",
-			UpstreamTool: "get_issue",
-			Server:       "work-tracker",
-			Description:  "Read a work item.",
-			InputSchema:  requiredStringSchema("issue_id"),
-			ExtractScope: RequiredStringScope(map[string]string{"issue_id": "issue_id"}),
+			GatewayTool:      "work.get_issue",
+			UpstreamTool:     "get_issue",
+			Server:           "work-tracker",
+			Description:      "Read a work item.",
+			InputSchema:      requiredStringSchema("issue_id"),
+			ExtractScope:     RequiredStringScope(map[string]string{"issue_id": "issue_id"}),
+			ResolveResources: trackerTicketResource,
 		},
 		{
 			GatewayTool:  "chat.post_message",
@@ -232,6 +242,30 @@ func TestOpenFGAIntegrationForMCPProxy(t *testing.T) {
 	if err := fga.Write(ctx, []mission.TupleKey{{
 		User: "agent:triage", Relation: "operator", Object: readServerID,
 	}}); err != nil {
+		t.Fatal(err)
+	}
+	agentProjectMembership := mission.TupleKey{
+		User: "agent:triage", Relation: "member", Object: "tracker_project:apollo",
+	}
+	if err := fga.Delete(ctx, []mission.TupleKey{agentProjectMembership}); err != nil {
+		t.Fatal(err)
+	}
+	deniedAfterResourceRevoke, err := client.CallTool(ctx, &mcp.CallToolParams{
+		Name: "work.get_issue",
+		Arguments: map[string]any{
+			"issue_id": "APOLLO-17",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !deniedAfterResourceRevoke.IsError || resultText(deniedAfterResourceRevoke) != "denied: denied by agent_resource_access" {
+		t.Fatalf("live OpenFGA resource revocation denial = %+v", deniedAfterResourceRevoke)
+	}
+	if fixture.callCount("get_issue") != 1 {
+		t.Fatalf("resource-revoked call reached upstream %d times", fixture.callCount("get_issue"))
+	}
+	if err := fga.Write(ctx, []mission.TupleKey{agentProjectMembership}); err != nil {
 		t.Fatal(err)
 	}
 	if err := fga.Delete(ctx, []mission.TupleKey{{

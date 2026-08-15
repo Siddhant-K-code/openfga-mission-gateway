@@ -1,4 +1,4 @@
-.PHONY: test integration demo fmt
+.PHONY: test integration demo showcase fmt
 
 test:
 	go test ./...
@@ -8,6 +8,9 @@ integration:
 
 demo:
 	go run ./cmd/demo
+
+showcase:
+	go run ./cmd/showcase
 
 fmt:
 	gofmt -w cmd internal

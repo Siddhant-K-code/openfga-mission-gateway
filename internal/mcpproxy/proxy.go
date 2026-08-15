@@ -45,6 +45,11 @@ func (upstream SessionUpstream) CallTool(
 // It must fail closed when it cannot derive a safe scope.
 type ScopeExtractor func(arguments map[string]any) (map[string]string, error)
 
+// ResourceResolver maps tool arguments to the concrete resources that need
+// independent authorization checks. It belongs to a connector, not the core
+// gateway, so the gateway remains domain-agnostic.
+type ResourceResolver func(arguments map[string]any) ([]mission.ResourceRequirement, error)
+
 // RequiredStringScope builds an extractor for tools whose protected fields are
 // required string arguments. The map key is the canonical scope key and its
 // value is the MCP argument name.
@@ -74,12 +79,13 @@ func RequiredStringScope(fields map[string]string) ScopeExtractor {
 }
 
 type ToolPolicy struct {
-	GatewayTool  string
-	UpstreamTool string
-	Server       string
-	Description  string
-	InputSchema  any
-	ExtractScope ScopeExtractor
+	GatewayTool      string
+	UpstreamTool     string
+	Server           string
+	Description      string
+	InputSchema      any
+	ExtractScope     ScopeExtractor
+	ResolveResources ResourceResolver
 }
 
 func (policy ToolPolicy) canonicalCall(arguments map[string]any) (mission.MCPCall, error) {
@@ -90,10 +96,18 @@ func (policy ToolPolicy) canonicalCall(arguments map[string]any) (mission.MCPCal
 	if err != nil {
 		return mission.MCPCall{}, err
 	}
+	var requirements []mission.ResourceRequirement
+	if policy.ResolveResources != nil {
+		requirements, err = policy.ResolveResources(arguments)
+		if err != nil {
+			return mission.MCPCall{}, err
+		}
+	}
 	return mission.MCPCall{
-		Server: policy.Server,
-		Tool:   policy.UpstreamTool,
-		Scope:  scope,
+		Server:       policy.Server,
+		Tool:         policy.UpstreamTool,
+		Scope:        scope,
+		Requirements: requirements,
 	}, nil
 }
 

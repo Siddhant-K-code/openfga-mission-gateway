@@ -88,6 +88,10 @@ func (store *InMemoryFGA) Check(
 		return checkTool(tuples, request.User, request.Relation, request.Object), nil
 	case strings.HasPrefix(request.Object, "mcp_call:"):
 		return checkCall(tuples, request.User, request.Relation, request.Object), nil
+	case strings.HasPrefix(request.Object, "tracker_project:"):
+		return checkTrackerProject(tuples, request.User, request.Relation, request.Object), nil
+	case strings.HasPrefix(request.Object, "tracker_ticket:"):
+		return checkTrackerTicket(tuples, request.User, request.Relation, request.Object), nil
 	case strings.HasPrefix(request.Object, "mission:"):
 		return checkMission(tuples, request.User, request.Relation, request.Object), nil
 	default:
@@ -178,6 +182,45 @@ func checkCall(
 		return false
 	case "can_invoke":
 		return checkCall(tuples, user, "invoker", call)
+	default:
+		return false
+	}
+}
+
+func checkTrackerProject(
+	tuples map[TupleKey]struct{},
+	user, relation, project string,
+) bool {
+	switch relation {
+	case "member":
+		return hasTuple(tuples, user, relation, project)
+	case "viewer", "can_read":
+		return checkTrackerProject(tuples, user, "member", project)
+	default:
+		return false
+	}
+}
+
+func checkTrackerTicket(
+	tuples map[TupleKey]struct{},
+	user, relation, ticket string,
+) bool {
+	switch relation {
+	case "project":
+		return hasTuple(tuples, user, relation, ticket)
+	case "viewer":
+		if hasTuple(tuples, user, relation, ticket) {
+			return true
+		}
+		for tuple := range tuples {
+			if tuple.Relation == "project" && tuple.Object == ticket &&
+				checkTrackerProject(tuples, user, "viewer", tuple.User) {
+				return true
+			}
+		}
+		return false
+	case "can_read":
+		return checkTrackerTicket(tuples, user, "viewer", ticket)
 	default:
 		return false
 	}
@@ -318,14 +361,22 @@ func (client *OpenFGAHTTP) do(
 // MCPCall is the policy-relevant shape of a tool invocation. Scope must
 // contain only normalized fields that affect authorization.
 type MCPCall struct {
-	Server string            `json:"server"`
-	Tool   string            `json:"tool"`
-	Scope  map[string]string `json:"scope,omitempty"`
+	Server       string                `json:"server"`
+	Tool         string                `json:"tool"`
+	Scope        map[string]string     `json:"scope,omitempty"`
+	Requirements []ResourceRequirement `json:"requirements,omitempty"`
 }
 
 type scopeEntry struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
+}
+
+// ResourceRequirement is a connector-derived OpenFGA check for a concrete
+// resource affected by an MCP call. It is part of a call's canonical identity.
+type ResourceRequirement struct {
+	Relation string `json:"relation"`
+	Object   string `json:"object"`
 }
 
 func (call MCPCall) ServerID() (string, error) {
@@ -352,13 +403,15 @@ func (call MCPCall) ID() (string, error) {
 		return "", err
 	}
 	return canonicalObjectID("mcp_call", struct {
-		Server string       `json:"server"`
-		Tool   string       `json:"tool"`
-		Scope  []scopeEntry `json:"scope"`
+		Server       string                `json:"server"`
+		Tool         string                `json:"tool"`
+		Scope        []scopeEntry          `json:"scope"`
+		Requirements []ResourceRequirement `json:"requirements"`
 	}{
-		Server: call.Server,
-		Tool:   call.Tool,
-		Scope:  call.canonicalScope(),
+		Server:       call.Server,
+		Tool:         call.Tool,
+		Scope:        call.canonicalScope(),
+		Requirements: call.canonicalRequirements(),
 	})
 }
 
@@ -381,6 +434,16 @@ func (call MCPCall) validate() error {
 			return fmt.Errorf("MCP call scope keys cannot be empty")
 		}
 	}
+	seenRequirements := make(map[ResourceRequirement]struct{}, len(call.Requirements))
+	for _, requirement := range call.Requirements {
+		if strings.TrimSpace(requirement.Relation) == "" || strings.TrimSpace(requirement.Object) == "" {
+			return fmt.Errorf("MCP call resource requirements need a relation and object")
+		}
+		if _, exists := seenRequirements[requirement]; exists {
+			return fmt.Errorf("MCP call resource requirements cannot be duplicated")
+		}
+		seenRequirements[requirement] = struct{}{}
+	}
 	return nil
 }
 
@@ -395,6 +458,17 @@ func (call MCPCall) canonicalScope() []scopeEntry {
 	return entries
 }
 
+func (call MCPCall) canonicalRequirements() []ResourceRequirement {
+	requirements := append([]ResourceRequirement(nil), call.Requirements...)
+	sort.Slice(requirements, func(i, j int) bool {
+		if requirements[i].Object == requirements[j].Object {
+			return requirements[i].Relation < requirements[j].Relation
+		}
+		return requirements[i].Object < requirements[j].Object
+	})
+	return requirements
+}
+
 func canonicalObjectID(prefix string, value any) (string, error) {
 	payload, err := json.Marshal(value)
 	if err != nil {
@@ -405,18 +479,21 @@ func canonicalObjectID(prefix string, value any) (string, error) {
 }
 
 type CallGrant struct {
-	Call             MCPCall `json:"call"`
-	RequiresApproval bool    `json:"requires_approval"`
+	Call             MCPCall   `json:"call"`
+	Risk             RiskLevel `json:"risk,omitempty"`
+	RequiresApproval bool      `json:"requires_approval"`
 }
 
 type IntentProposal struct {
 	UserPrompt string      `json:"user_prompt"`
+	Rationale  string      `json:"rationale,omitempty"`
 	Grants     []CallGrant `json:"grants"`
 }
 
 type MissionGrant struct {
-	CallID           string `json:"call_id"`
-	RequiresApproval bool   `json:"requires_approval"`
+	CallID           string    `json:"call_id"`
+	Risk             RiskLevel `json:"risk,omitempty"`
+	RequiresApproval bool      `json:"requires_approval"`
 }
 
 type Mission struct {
@@ -428,6 +505,8 @@ type Mission struct {
 	Grants           []MissionGrant
 	State            MissionState
 	Version          int
+	MaxDispatches    int
+	DispatchCount    int
 	ApprovalPreviews map[string]string
 	ApprovedCalls    map[string]bool
 }
@@ -542,13 +621,7 @@ func FilterAuthorizedCandidates(
 ) ([]MCPCall, error) {
 	allowed := make([]MCPCall, 0, len(candidates))
 	for _, candidate := range candidates {
-		callID, err := candidate.ID()
-		if err != nil {
-			return nil, err
-		}
-		canInvoke, err := fga.Check(ctx, CheckRequest{
-			User: requester, Relation: "can_invoke", Object: callID,
-		})
+		canInvoke, err := CanInvokeCall(ctx, fga, requester, candidate)
 		if err != nil {
 			return nil, err
 		}
@@ -559,26 +632,80 @@ func FilterAuthorizedCandidates(
 	return allowed, nil
 }
 
+// CanInvokeCall checks both the generic MCP tool authority and every concrete
+// resource requirement derived by the connector.
+func CanInvokeCall(
+	ctx context.Context,
+	fga FGAStore,
+	principal string,
+	call MCPCall,
+) (bool, error) {
+	callID, err := call.ID()
+	if err != nil {
+		return false, err
+	}
+	topology, err := callTopologyTuples(call)
+	if err != nil {
+		return false, err
+	}
+	canInvoke, err := fga.Check(ctx, CheckRequest{
+		User: principal, Relation: "can_invoke", Object: callID, ContextualTuples: topology,
+	})
+	if err != nil || !canInvoke {
+		return canInvoke, err
+	}
+	for _, requirement := range call.canonicalRequirements() {
+		allowed, err := fga.Check(ctx, CheckRequest{
+			User:     principal,
+			Relation: requirement.Relation,
+			Object:   requirement.Object,
+		})
+		if err != nil || !allowed {
+			return allowed, err
+		}
+	}
+	return true, nil
+}
+
+// callTopologyTuples derives the final tool-to-call edge from a connector's
+// trusted canonicalization. It avoids persisting one graph tuple for every
+// scoped resource call.
+func callTopologyTuples(call MCPCall) ([]TupleKey, error) {
+	toolID, err := call.ToolID()
+	if err != nil {
+		return nil, err
+	}
+	callID, err := call.ID()
+	if err != nil {
+		return nil, err
+	}
+	return []TupleKey{{User: toolID, Relation: "tool", Object: callID}}, nil
+}
+
 type MissionService struct {
-	fga      FGAStore
-	signer   *MissionTokenSigner
-	mu       sync.RWMutex
-	missions map[string]*Mission
+	fga       FGAStore
+	signer    *MissionTokenSigner
+	mu        sync.RWMutex
+	missions  map[string]*Mission
+	timelines map[string][]TimelineEvent
+	nextEvent int
 }
 
 type CreateMissionInput struct {
-	MissionID string
-	Requester string
-	Agent     string
-	Intent    IntentProposal
-	ExpiresAt time.Time
+	MissionID     string
+	Requester     string
+	Agent         string
+	Intent        IntentProposal
+	ExpiresAt     time.Time
+	MaxDispatches int
 }
 
 func NewMissionService(fga FGAStore, signer *MissionTokenSigner) *MissionService {
 	return &MissionService{
-		fga:      fga,
-		signer:   signer,
-		missions: make(map[string]*Mission),
+		fga:       fga,
+		signer:    signer,
+		missions:  make(map[string]*Mission),
+		timelines: make(map[string][]TimelineEvent),
 	}
 }
 
@@ -593,6 +720,9 @@ func (service *MissionService) CreateDraft(
 	}
 	if !input.ExpiresAt.After(time.Now()) {
 		return nil, fmt.Errorf("Mission expiry must be in the future")
+	}
+	if input.MaxDispatches < 0 {
+		return nil, fmt.Errorf("Mission dispatch budget cannot be negative")
 	}
 
 	grants, err := normalizeGrants(input.Intent.Grants)
@@ -609,15 +739,17 @@ func (service *MissionService) CreateDraft(
 		ID:               input.MissionID,
 		Requester:        input.Requester,
 		Agent:            input.Agent,
-		Intent:           input.Intent,
+		Intent:           cloneIntent(input.Intent),
 		ExpiresAt:        input.ExpiresAt.UTC(),
 		Grants:           grants,
 		State:            MissionDraft,
 		Version:          1,
+		MaxDispatches:    input.MaxDispatches,
 		ApprovalPreviews: make(map[string]string),
 		ApprovedCalls:    make(map[string]bool),
 	}
 	service.missions[mission.ID] = mission
+	service.recordEventLocked(mission, TimelineProposed, input.Requester, "Mission proposed", "", nil)
 	return cloneMission(mission), nil
 }
 
@@ -634,6 +766,7 @@ func normalizeGrants(input []CallGrant) ([]MissionGrant, error) {
 		}
 		grant := MissionGrant{
 			CallID:           callID,
+			Risk:             inputGrant.Risk,
 			RequiresApproval: inputGrant.RequiresApproval,
 		}
 		if existing, exists := byCallID[callID]; exists && existing != grant {
@@ -678,6 +811,7 @@ func (service *MissionService) Approve(
 	}
 
 	mission.State = MissionActive
+	service.recordEventLocked(mission, TimelineActivated, actor, "Mission approved and token issued", "", nil)
 	return service.signer.Issue(mission)
 }
 
@@ -704,6 +838,7 @@ func (service *MissionService) RequestApproval(
 
 	mission.ApprovalPreviews[callID] = preview
 	mission.ApprovedCalls[callID] = false
+	service.recordEventLocked(mission, TimelineApprovalRequested, mission.Agent, "Approval requested for side effect", callID, nil)
 	return nil
 }
 
@@ -724,6 +859,7 @@ func (service *MissionService) ApproveCall(
 		return fmt.Errorf("call approval requires a preview")
 	}
 	mission.ApprovedCalls[callID] = true
+	service.recordEventLocked(mission, TimelineApprovalGranted, actor, "Side effect approved", callID, nil)
 	return nil
 }
 
@@ -739,6 +875,7 @@ func (service *MissionService) Revoke(missionID string) error {
 		return fmt.Errorf("only an active Mission may be revoked")
 	}
 	mission.State = MissionRevoked
+	service.recordEventLocked(mission, TimelineRevoked, mission.Requester, "Mission revoked", "", nil)
 	return nil
 }
 
@@ -754,7 +891,47 @@ func (service *MissionService) Complete(missionID string) error {
 		return fmt.Errorf("only an active Mission may be completed")
 	}
 	mission.State = MissionCompleted
+	service.recordEventLocked(mission, TimelineCompleted, mission.Requester, "Mission completed", "", nil)
 	return nil
+}
+
+// ReserveDispatch atomically applies the Mission-local controls immediately
+// before a gateway forwards an allowed call. It counts authorization attempts;
+// the upstream side effect remains outside this transaction boundary.
+func (service *MissionService) ReserveDispatch(
+	missionID string,
+	version int,
+	callID string,
+	now time.Time,
+) (string, error) {
+	service.mu.Lock()
+	defer service.mu.Unlock()
+
+	mission, err := service.getLocked(missionID)
+	if err != nil {
+		return "unknown Mission", err
+	}
+	if mission.Version != version {
+		return "Mission token is stale", nil
+	}
+	if mission.State != MissionActive {
+		return "Mission is " + string(mission.State), nil
+	}
+	if !mission.ExpiresAt.After(now) {
+		return "Mission expired", nil
+	}
+	grant, exists := mission.Grant(callID)
+	if !exists {
+		return "denied by mission_call_scope", nil
+	}
+	if grant.RequiresApproval && !mission.ApprovedCalls[callID] {
+		return "call approval is required", nil
+	}
+	if mission.MaxDispatches > 0 && mission.DispatchCount >= mission.MaxDispatches {
+		return "Mission dispatch budget exhausted", nil
+	}
+	mission.DispatchCount++
+	return "", nil
 }
 
 func (service *MissionService) Get(missionID string) (*Mission, error) {
@@ -780,7 +957,11 @@ func (service *MissionService) validateCurrentAuthority(
 	ctx context.Context,
 	mission *Mission,
 ) error {
-	for _, callID := range mission.CallIDs() {
+	for _, grant := range mission.Intent.Grants {
+		callID, err := grant.Call.ID()
+		if err != nil {
+			return err
+		}
 		for _, principal := range []struct {
 			name string
 			id   string
@@ -788,9 +969,7 @@ func (service *MissionService) validateCurrentAuthority(
 			{name: "requester", id: mission.Requester},
 			{name: "agent", id: mission.Agent},
 		} {
-			allowed, err := service.fga.Check(ctx, CheckRequest{
-				User: principal.id, Relation: "can_invoke", Object: callID,
-			})
+			allowed, err := CanInvokeCall(ctx, service.fga, principal.id, grant.Call)
 			if err != nil {
 				return err
 			}
@@ -809,7 +988,7 @@ func (service *MissionService) validateCurrentAuthority(
 
 func cloneMission(mission *Mission) *Mission {
 	copy := *mission
-	copy.Intent.Grants = append([]CallGrant(nil), mission.Intent.Grants...)
+	copy.Intent = cloneIntent(mission.Intent)
 	copy.Grants = append([]MissionGrant(nil), mission.Grants...)
 	copy.ApprovalPreviews = make(map[string]string, len(mission.ApprovalPreviews))
 	for callID, preview := range mission.ApprovalPreviews {
@@ -822,9 +1001,21 @@ func cloneMission(mission *Mission) *Mission {
 	return &copy
 }
 
+func cloneIntent(intent IntentProposal) IntentProposal {
+	copy := intent
+	copy.Grants = append([]CallGrant(nil), intent.Grants...)
+	for index, grant := range copy.Grants {
+		calls := cloneCalls([]MCPCall{grant.Call})
+		copy.Grants[index].Call = calls[0]
+	}
+	return copy
+}
+
 type CheckResult struct {
-	Name    string `json:"name"`
-	Allowed bool   `json:"allowed"`
+	Name     string `json:"name"`
+	Allowed  bool   `json:"allowed"`
+	Relation string `json:"relation,omitempty"`
+	Object   string `json:"object,omitempty"`
 }
 
 type Decision struct {
@@ -832,6 +1023,8 @@ type Decision struct {
 	Reason         string        `json:"reason"`
 	MissionID      string        `json:"mission_id,omitempty"`
 	MissionVersion int           `json:"mission_version,omitempty"`
+	Agent          string        `json:"agent,omitempty"`
+	Call           *MCPCall      `json:"call,omitempty"`
 	Checks         []CheckResult `json:"checks"`
 	Timestamp      time.Time     `json:"timestamp"`
 }
@@ -865,11 +1058,11 @@ func (gateway *Gateway) Authorize(
 ) Decision {
 	claims, err := gateway.signer.Verify(request.MissionToken, now)
 	if err != nil {
-		return gateway.record(false, err.Error(), nil, nil, now)
+		return gateway.record(false, err.Error(), nil, nil, request, now)
 	}
 	mission, err := gateway.missions.Get(claims.MissionID)
 	if err != nil {
-		return gateway.record(false, err.Error(), nil, nil, now)
+		return gateway.record(false, err.Error(), nil, nil, request, now)
 	}
 
 	if claims.Agent != request.Agent || mission.Agent != request.Agent {
@@ -878,6 +1071,7 @@ func (gateway *Gateway) Authorize(
 			"Mission token is not bound to this agent",
 			mission,
 			[]CheckResult{{Name: "agent_binding", Allowed: false}},
+			request,
 			now,
 		)
 	}
@@ -887,6 +1081,7 @@ func (gateway *Gateway) Authorize(
 			"Mission token is stale",
 			mission,
 			[]CheckResult{{Name: "mission_version", Allowed: false}},
+			request,
 			now,
 		)
 	}
@@ -896,6 +1091,7 @@ func (gateway *Gateway) Authorize(
 			"Mission is "+string(mission.State),
 			mission,
 			[]CheckResult{{Name: "mission_active", Allowed: false}},
+			request,
 			now,
 		)
 	}
@@ -905,15 +1101,21 @@ func (gateway *Gateway) Authorize(
 			"Mission expired",
 			mission,
 			[]CheckResult{{Name: "mission_expiry", Allowed: false}},
+			request,
 			now,
 		)
 	}
 
 	callID, err := request.Call.ID()
 	if err != nil {
-		return gateway.record(false, err.Error(), mission, nil, now)
+		return gateway.record(false, err.Error(), mission, nil, request, now)
 	}
 	contextualTuples := missionContextualTuples(mission, claims)
+	topology, err := callTopologyTuples(request.Call)
+	if err != nil {
+		return gateway.record(false, err.Error(), mission, nil, request, now)
+	}
+	contextualTuples = append(contextualTuples, topology...)
 
 	baseAccess, err := gateway.fga.Check(ctx, CheckRequest{
 		User:             mission.Requester,
@@ -922,7 +1124,7 @@ func (gateway *Gateway) Authorize(
 		ContextualTuples: contextualTuples,
 	})
 	if err != nil {
-		return gateway.record(false, "authorization check failed", mission, nil, now)
+		return gateway.record(false, "authorization check failed", mission, nil, request, now)
 	}
 	agentAccess, err := gateway.fga.Check(ctx, CheckRequest{
 		User:             request.Agent,
@@ -931,7 +1133,7 @@ func (gateway *Gateway) Authorize(
 		ContextualTuples: contextualTuples,
 	})
 	if err != nil {
-		return gateway.record(false, "authorization check failed", mission, nil, now)
+		return gateway.record(false, "authorization check failed", mission, nil, request, now)
 	}
 	agentBound, err := gateway.fga.Check(ctx, CheckRequest{
 		User:             request.Agent,
@@ -940,7 +1142,7 @@ func (gateway *Gateway) Authorize(
 		ContextualTuples: contextualTuples,
 	})
 	if err != nil {
-		return gateway.record(false, "authorization check failed", mission, nil, now)
+		return gateway.record(false, "authorization check failed", mission, nil, request, now)
 	}
 	missionScope, err := gateway.fga.Check(ctx, CheckRequest{
 		User:             callID,
@@ -949,7 +1151,7 @@ func (gateway *Gateway) Authorize(
 		ContextualTuples: contextualTuples,
 	})
 	if err != nil {
-		return gateway.record(false, "authorization check failed", mission, nil, now)
+		return gateway.record(false, "authorization check failed", mission, nil, request, now)
 	}
 
 	checks := []CheckResult{
@@ -958,6 +1160,30 @@ func (gateway *Gateway) Authorize(
 		{Name: "agent_bound_to_mission", Allowed: agentBound},
 		{Name: "mission_call_scope", Allowed: missionScope},
 	}
+	for _, requirement := range request.Call.canonicalRequirements() {
+		requesterResourceAccess, err := gateway.fga.Check(ctx, CheckRequest{
+			User: mission.Requester, Relation: requirement.Relation, Object: requirement.Object,
+		})
+		if err != nil {
+			return gateway.record(false, "authorization check failed", mission, nil, request, now)
+		}
+		agentResourceAccess, err := gateway.fga.Check(ctx, CheckRequest{
+			User: request.Agent, Relation: requirement.Relation, Object: requirement.Object,
+		})
+		if err != nil {
+			return gateway.record(false, "authorization check failed", mission, nil, request, now)
+		}
+		checks = append(checks,
+			CheckResult{
+				Name: "requester_resource_access", Allowed: requesterResourceAccess,
+				Relation: requirement.Relation, Object: requirement.Object,
+			},
+			CheckResult{
+				Name: "agent_resource_access", Allowed: agentResourceAccess,
+				Relation: requirement.Relation, Object: requirement.Object,
+			},
+		)
+	}
 	for _, check := range checks {
 		if !check.Allowed {
 			return gateway.record(
@@ -965,6 +1191,7 @@ func (gateway *Gateway) Authorize(
 				"denied by "+check.Name,
 				mission,
 				checks,
+				request,
 				now,
 			)
 		}
@@ -982,12 +1209,25 @@ func (gateway *Gateway) Authorize(
 				"call approval is required",
 				mission,
 				checks,
+				request,
 				now,
 			)
 		}
 	}
 
-	return gateway.record(true, "authorized", mission, checks, now)
+	reserveReason, err := gateway.missions.ReserveDispatch(mission.ID, claims.Version, callID, now)
+	if err != nil {
+		return gateway.record(false, "authorization check failed", mission, checks, request, now)
+	}
+	if reserveReason != "" {
+		checks = append(checks, CheckResult{Name: "mission_dispatch_control", Allowed: false})
+		return gateway.record(false, reserveReason, mission, checks, request, now)
+	}
+	if mission.MaxDispatches > 0 {
+		checks = append(checks, CheckResult{Name: "mission_dispatch_budget", Allowed: true})
+	}
+
+	return gateway.record(true, "authorized", mission, checks, request, now)
 }
 
 func missionContextualTuples(
@@ -1038,13 +1278,19 @@ func (gateway *Gateway) record(
 	reason string,
 	mission *Mission,
 	checks []CheckResult,
+	request AuthorizationRequest,
 	now time.Time,
 ) Decision {
 	decision := Decision{
 		Allowed:   allowed,
 		Reason:    reason,
+		Agent:     request.Agent,
 		Checks:    append([]CheckResult(nil), checks...),
 		Timestamp: now.UTC(),
+	}
+	if request.Call.Server != "" || request.Call.Tool != "" {
+		call := cloneCalls([]MCPCall{request.Call})[0]
+		decision.Call = &call
 	}
 	if mission != nil {
 		decision.MissionID = mission.ID
@@ -1052,8 +1298,9 @@ func (gateway *Gateway) record(
 	}
 
 	gateway.mu.Lock()
-	defer gateway.mu.Unlock()
 	gateway.auditLog = append(gateway.auditLog, decision)
+	gateway.mu.Unlock()
+	gateway.missions.recordDecision(decision)
 	return decision
 }
 
@@ -1074,11 +1321,19 @@ func DemoEnvironment(
 			Server: "work-tracker",
 			Tool:   "get_issue",
 			Scope:  map[string]string{"issue_id": "APOLLO-17"},
+			Requirements: []ResourceRequirement{{
+				Relation: "can_read",
+				Object:   "tracker_ticket:APOLLO-17",
+			}},
 		},
 		Inaccessible: MCPCall{
-			Server: "restricted-tracker",
+			Server: "work-tracker",
 			Tool:   "get_issue",
 			Scope:  map[string]string{"issue_id": "HERMES-1"},
+			Requirements: []ResourceRequirement{{
+				Relation: "can_read",
+				Object:   "tracker_ticket:HERMES-1",
+			}},
 		},
 		PostSummary: MCPCall{
 			Server: "team-chat",
@@ -1115,6 +1370,10 @@ func DemoEnvironment(
 		TupleKey{User: "user:alice", Relation: "operator", Object: teamChatID},
 		TupleKey{User: "agent:triage", Relation: "operator", Object: workTrackerID},
 		TupleKey{User: "agent:triage", Relation: "operator", Object: teamChatID},
+		TupleKey{User: "tracker_project:apollo", Relation: "project", Object: "tracker_ticket:APOLLO-17"},
+		TupleKey{User: "tracker_project:hermes", Relation: "project", Object: "tracker_ticket:HERMES-1"},
+		TupleKey{User: "user:alice", Relation: "member", Object: "tracker_project:apollo"},
+		TupleKey{User: "agent:triage", Relation: "member", Object: "tracker_project:apollo"},
 	)
 	fga := NewInMemoryFGA(durableTuples)
 
@@ -1123,19 +1382,30 @@ func DemoEnvironment(
 		return nil, nil, nil, "", DemoCalls{}, err
 	}
 	missions := NewMissionService(fga, signer)
-	_, err = missions.CreateDraft(CreateMissionInput{
-		MissionID: "apollo-17-product-summary-v1",
-		Requester: "user:alice",
-		Agent:     "agent:triage",
-		Intent: IntentProposal{
-			UserPrompt: "Read APOLLO-17 and post a summary to the product channel.",
-			Grants: []CallGrant{
-				{Call: calls.ReadIssue},
-				{Call: calls.PostSummary, RequiresApproval: true},
-			},
+	_, err = missions.Propose(ctx,
+		StaticIntentEvaluator{
+			Calls:     []MCPCall{calls.ReadIssue, calls.PostSummary},
+			Rationale: "Read the selected ticket and request approval before posting.",
 		},
-		ExpiresAt: time.Now().Add(time.Hour),
-	})
+		ToolPolicyResolver{
+			Rules: map[string]CallPolicy{
+				"team-chat/post_message": {
+					Risk:             RiskHigh,
+					RequiresApproval: true,
+				},
+			},
+			Default: CallPolicy{Risk: RiskLow},
+		},
+		ProposeMissionInput{
+			MissionID:     "apollo-17-product-summary-v1",
+			Requester:     "user:alice",
+			Agent:         "agent:triage",
+			Prompt:        "Read APOLLO-17 and post a summary to the product channel.",
+			Candidates:    []MCPCall{calls.ReadIssue, calls.PostSummary},
+			ExpiresAt:     time.Now().Add(time.Hour),
+			MaxDispatches: 3,
+		},
+	)
 	if err != nil {
 		return nil, nil, nil, "", DemoCalls{}, err
 	}
@@ -1152,8 +1422,8 @@ func DemoEnvironment(
 }
 
 func durableCallTuples(calls []MCPCall) ([]TupleKey, error) {
-	tuples := make([]TupleKey, 0, len(calls)*2)
-	seen := make(map[TupleKey]struct{}, len(calls)*2)
+	tuples := make([]TupleKey, 0, len(calls))
+	seen := make(map[TupleKey]struct{}, len(calls))
 	for _, call := range calls {
 		serverID, err := call.ServerID()
 		if err != nil {
@@ -1163,14 +1433,7 @@ func durableCallTuples(calls []MCPCall) ([]TupleKey, error) {
 		if err != nil {
 			return nil, err
 		}
-		callID, err := call.ID()
-		if err != nil {
-			return nil, err
-		}
-		for _, tuple := range []TupleKey{
-			{User: serverID, Relation: "server", Object: toolID},
-			{User: toolID, Relation: "tool", Object: callID},
-		} {
+		for _, tuple := range []TupleKey{{User: serverID, Relation: "server", Object: toolID}} {
 			if _, exists := seen[tuple]; exists {
 				continue
 			}

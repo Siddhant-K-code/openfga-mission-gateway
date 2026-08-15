@@ -17,9 +17,19 @@
         "object": "mcp_tool:get-issue"
       },
       {
-        "user": "mcp_tool:get-issue",
-        "relation": "tool",
-        "object": "mcp_call:get-apollo-17"
+        "user": "user:alice",
+        "relation": "member",
+        "object": "tracker_project:apollo"
+      },
+      {
+        "user": "agent:triage",
+        "relation": "member",
+        "object": "tracker_project:apollo"
+      },
+      {
+        "user": "tracker_project:apollo",
+        "relation": "project",
+        "object": "tracker_ticket:APOLLO-17"
       }
     ]
   }

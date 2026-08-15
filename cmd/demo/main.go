@@ -84,6 +84,16 @@ func main() {
 		Agent:        "agent:triage",
 		Call:         calls.ReadIssue,
 	}, time.Now()))
+
+	timeline, err := missions.Timeline("apollo-17-product-summary-v1")
+	if err != nil {
+		log.Fatal(err)
+	}
+	body, err := json.MarshalIndent(timeline, "", "  ")
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("Mission timeline\n%s\n", body)
 }
 
 func show(label string, decision mission.Decision) {

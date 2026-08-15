@@ -3,6 +3,7 @@ package mcpproxy
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -166,6 +167,10 @@ func newProxyEnvironment(t *testing.T, upstream Upstream) (*Proxy, *mission.Miss
 		Server: "work-tracker",
 		Tool:   "get_issue",
 		Scope:  map[string]string{"issue_id": "APOLLO-17"},
+		Requirements: []mission.ResourceRequirement{{
+			Relation: "can_read",
+			Object:   "tracker_ticket:APOLLO-17",
+		}},
 	}
 	postCall := mission.MCPCall{
 		Server: "team-chat",
@@ -180,6 +185,11 @@ func newProxyEnvironment(t *testing.T, upstream Upstream) (*Proxy, *mission.Miss
 
 	tuples := append(durableTuples(t, readCall), durableTuples(t, postCall)...)
 	tuples = append(tuples, durableTuples(t, otherTarget)...)
+	tuples = append(tuples,
+		mission.TupleKey{User: "tracker_project:apollo", Relation: "project", Object: "tracker_ticket:APOLLO-17"},
+		mission.TupleKey{User: "user:alice", Relation: "member", Object: "tracker_project:apollo"},
+		mission.TupleKey{User: "agent:triage", Relation: "member", Object: "tracker_project:apollo"},
+	)
 	for _, call := range []mission.MCPCall{readCall, postCall, otherTarget} {
 		serverID, err := call.ServerID()
 		if err != nil {
@@ -217,12 +227,13 @@ func newProxyEnvironment(t *testing.T, upstream Upstream) (*Proxy, *mission.Miss
 	}
 	proxy, err := New(mission.NewGateway(fga, missions, signer), signer, upstream, []ToolPolicy{
 		{
-			GatewayTool:  "work.get_issue",
-			UpstreamTool: "get_issue",
-			Server:       "work-tracker",
-			Description:  "Read a work item.",
-			InputSchema:  requiredStringSchema("issue_id"),
-			ExtractScope: RequiredStringScope(map[string]string{"issue_id": "issue_id"}),
+			GatewayTool:      "work.get_issue",
+			UpstreamTool:     "get_issue",
+			Server:           "work-tracker",
+			Description:      "Read a work item.",
+			InputSchema:      requiredStringSchema("issue_id"),
+			ExtractScope:     RequiredStringScope(map[string]string{"issue_id": "issue_id"}),
+			ResolveResources: trackerTicketResource,
 		},
 		{
 			GatewayTool:  "chat.post_message",
@@ -239,6 +250,17 @@ func newProxyEnvironment(t *testing.T, upstream Upstream) (*Proxy, *mission.Miss
 	return proxy, missions, token
 }
 
+func trackerTicketResource(arguments map[string]any) ([]mission.ResourceRequirement, error) {
+	issueID, ok := arguments["issue_id"].(string)
+	if !ok || issueID == "" {
+		return nil, fmt.Errorf("issue_id must be a non-empty string")
+	}
+	return []mission.ResourceRequirement{{
+		Relation: "can_read",
+		Object:   "tracker_ticket:" + issueID,
+	}}, nil
+}
+
 func durableTuples(t *testing.T, call mission.MCPCall) []mission.TupleKey {
 	t.Helper()
 	serverID, err := call.ServerID()
@@ -249,13 +271,8 @@ func durableTuples(t *testing.T, call mission.MCPCall) []mission.TupleKey {
 	if err != nil {
 		t.Fatal(err)
 	}
-	callID, err := call.ID()
-	if err != nil {
-		t.Fatal(err)
-	}
 	return []mission.TupleKey{
 		{User: serverID, Relation: "server", Object: toolID},
-		{User: toolID, Relation: "tool", Object: callID},
 	}
 }
 

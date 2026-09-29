@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f6f8fa">
+  <title>Mission Gateway · Security Decision Debugger</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to decision debugger</a>
+  <header class="app-header">
+    <div class="brand"><svg width="26" height="26" viewBox="0 0 26 26" fill="none" aria-hidden="true"><path d="M3 4h6v18H3M23 4h-6v18h6M6 13h14m-4-4 4 4-4 4" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg><span>Mission Gateway</span><span class="header-divider">/</span><span class="header-context">Decision debugger</span></div>
+    <div class="header-actions"><span class="demo-badge"><span class="dot"></span>Local demo</span><button id="reset" data-action="reset" class="button subtle" disabled>Reset demo</button></div>
+  </header>
+  <main id="main" tabindex="-1">
+    <div class="page-heading"><div><h1>Security decision debugger</h1><p>Task-scoped MCP authorization. Inspect the delegation, exercise a call, follow the decision.</p></div><a href="#configuration" class="text-link">What’s configured?</a></div>
+
+    <section class="decision-model" aria-labelledby="model-title">
+      <div class="section-heading compact"><h2 id="model-title">How this decision works</h2><span class="fail-closed">Any <b>NO</b> / <b>UNKNOWN</b> → <b>DENY</b></span></div>
+      <ol class="stages">
+        <li><span class="stage-number">1</span><div><strong>Mission</strong><span>What was delegated</span></div><span class="stage-arrow" aria-hidden="true">→</span></li>
+        <li><span class="stage-number">2</span><div><strong>OpenFGA</strong><span>Current access</span></div><span class="stage-arrow" aria-hidden="true">→</span></li>
+        <li><span class="stage-number">3</span><div><strong>Policy</strong><span>Risk &amp; approval</span></div><span class="stage-arrow" aria-hidden="true">→</span></li>
+        <li><span class="stage-number">4</span><div><strong>Gateway</strong><span>Final enforcement</span></div></li>
+      </ol>
+    </section>
+
+    <div id="error" class="error" role="alert" hidden><span id="error-message"></span><button class="button" id="retry-load">Refresh state</button></div>
+    <p id="announcement" class="sr-only" role="status" aria-live="polite"></p>
+    <noscript><p class="error">Enable JavaScript to load the Mission and exercise the gateway.</p></noscript>
+
+    <section class="delegation panel" aria-labelledby="delegation-title" aria-busy="true" id="delegation">
+      <div class="authority-summary">
+        <div class="section-heading"><h2 id="delegation-title">Delegated authority</h2><span id="mission-state" class="badge">Loading…</span></div>
+        <dl class="identity-list"><div><dt>Requester</dt><dd><code id="requester" translate="no">—</code></dd></div><div><dt>Agent</dt><dd><code id="agent" translate="no">—</code></dd></div></dl>
+        <div class="mission-metrics"><div><span>Time remaining</span><strong id="expires">—</strong></div><div><span>Dispatch budget</span><strong><span id="dispatches">—</span> <small>used</small></strong></div></div>
+        <div id="budget-meter" class="budget-meter" role="meter" aria-label="Dispatch budget used" aria-valuemin="0" aria-valuemax="3" aria-valuenow="0"><i></i><i></i><i></i></div>
+        <div id="allowed-summary" class="allowed-summary"></div>
+        <details class="quiet-details"><summary>Mission details</summary><dl class="detail-list"><div><dt>Mission ID</dt><dd><code id="mission-id" translate="no"></code></dd></div><div><dt>Expires at</dt><dd id="expires-at"></dd></div></dl></details>
+      </div>
+      <div class="intent-summary"><h2>User intent</h2><p id="prompt" class="intent">Loading delegated task…</p><p class="intent-note">Alice delegates two exact calls to the triage agent. Every attempt rechecks current authority.</p></div>
+      <div class="scope-section"><div class="section-heading"><h2>Allowed actions</h2><span class="muted">Exact targets. No wildcard access.</span></div><div id="grants" class="grants"><p class="muted">Loading scope…</p></div></div>
+    </section>
+
+    <section class="exercise" aria-labelledby="exercise-title">
+      <div class="section-heading"><div><h2 id="exercise-title">Exercise the gateway</h2><p class="section-note">Start with a read, then test the boundaries.</p></div><span id="request-status" class="muted" role="status" aria-live="polite"></span></div>
+      <div class="actions">
+        <button class="scenario primary" data-action="read" disabled><span class="scenario-label" id="read-label">✓ Allowed</span><strong>Read APOLLO-17</strong><span>Check the delegated read</span></button>
+        <button class="scenario" data-action="post" disabled><span class="scenario-label amber" id="post-label">! Approval required</span><strong>Post to #product</strong><span>Test the side-effect policy</span></button>
+        <button class="scenario" data-action="outside_scope" disabled><span class="scenario-label red">× Out of scope</span><strong>Post to #company</strong><span>Same tool, different target</span></button>
+        <button class="scenario" data-action="revoke_source" id="revoke-button" disabled><span class="scenario-label red" id="revoke-label">× Revoke source access</span><strong id="revoke-title">Revoke Alice’s work-tracker access</strong><span id="revoke-note">Prove immediate revocation</span></button>
+      </div>
+    </section>
+
+    <div class="inspection">
+      <section class="panel decision-panel" aria-labelledby="decision-title">
+        <div class="section-heading panel-heading"><h2 id="decision-title" tabindex="-1">Last decision</h2><span id="decision-badge" class="badge">Ready to inspect</span></div>
+        <div class="decision-overview"><div><code id="decision-call" translate="no">No call attempted</code><p id="decision-reason">Choose “Read APOLLO-17” to inspect the authorization checks.</p></div><time id="decision-time"></time></div>
+        <div id="approval" class="approval" hidden>
+          <div class="section-heading compact"><h3>Action paused</h3><span class="badge amber">High risk</span></div>
+          <code translate="no">post_message(#product)</code><p>Requires requester approval from Alice.</p>
+          <div class="preview"><span>Message preview</span><blockquote id="approval-preview"></blockquote></div>
+          <div class="approval-bottom"><button data-action="approve_retry" class="button approve" disabled>Approve &amp; retry #product post</button><span>Acting as Alice in this demo</span></div>
+          <p class="approval-note">Demo preview. Approval applies to the delegated call scope.</p>
+        </div>
+        <div class="trace-header"><span>Authorization check</span><span>Result</span></div>
+        <ol id="checks" class="checks"><li class="trace-empty">The gateway’s checks will appear here.</li></ol>
+        <div id="decision-footnote" class="decision-footnote">A call is allowed only when every required gate passes.</div>
+        <details id="decision-details" class="decision-details"><summary>Decision details <span>Lifecycle checks &amp; raw evidence</span></summary><div id="extra-checks"></div><pre id="decision-json" tabindex="0">No decision yet.</pre></details>
+      </section>
+
+      <aside class="authority-panel" aria-labelledby="authority-title">
+        <div class="section-heading"><h2 id="authority-title">Current authority</h2><span class="badge">OpenFGA</span></div><p class="section-note">Rechecked on every call. The token does not preserve revoked access.</p>
+        <div class="authority-group"><h3>Tool access</h3><div id="tool-graph" class="tool-graph"></div></div>
+        <div class="authority-group"><h3>Resource access</h3><div class="resource-graph"><div class="principals"><div><span class="person-icon" aria-hidden="true">A</span>Alice <span id="alice-resource" class="green">✓</span></div><div><span class="person-icon agent-icon" aria-hidden="true">T</span>Triage <span id="agent-resource" class="green">✓</span></div></div><div class="graph-join" aria-hidden="true"></div><div class="project-node"><span id="resource-relation">Members of</span><strong>Apollo project</strong></div></div><div class="ticket-link"><span aria-hidden="true">└─</span><code translate="no">APOLLO-17</code><span>can_read</span></div></div>
+        <p id="authority-note" class="authority-note">Loading current access…</p>
+        <div class="enforcement-note"><h3>Who decides?</h3><p>OpenFGA evaluates relationships. Mission limits the task. Policy gates risky calls. The gateway enforces the combined result.</p><strong>Any NO / UNKNOWN → DENY</strong></div>
+      </aside>
+    </div>
+
+    <section class="configuration" id="configuration" aria-labelledby="configuration-title"><div class="section-heading"><h2 id="configuration-title">Where does this come from?</h2><span class="muted">Configured vs. dynamic</span></div><div class="configuration-grid"><div><span class="config-type">Preconfigured once</span><ul><li>Tool → protected fields</li><li>Resource mapping</li><li>Risk &amp; approval policy</li></ul></div><div><span class="config-type">Dynamic per task</span><ul><li><code translate="no">APOLLO-17</code> &amp; <code translate="no">#product</code></li><li>Mission expiry</li><li>Dispatch budget</li></ul></div><div><span class="config-type">POC today</span><ul><li>Candidate resolution is static</li><li>Intent evaluation is static</li><li>Scope is fixed for this walkthrough</li></ul></div></div></section>
+
+    <section class="timeline-section" aria-labelledby="timeline-title"><div class="section-heading"><h2 id="timeline-title">Timeline</h2><span id="event-count" class="muted">Loading events…</span></div><ol id="timeline" class="timeline"></ol></section>
+
+    <footer><strong>Demo mode</strong><ul><li>Mission state <span>In-memory</span></li><li>Authorization <span>In-memory OpenFGA-compatible evaluator*</span></li><li>Candidate resolver <span>Static</span></li><li>Gateway enforcement <span>Real</span></li><li>MCP proxy path <span>Implemented separately</span></li></ul><p>*Evaluates this repository’s model only. This showcase runs authorization; it does not send upstream MCP requests.</p></footer>
+  </main>
+</body>
+</html>

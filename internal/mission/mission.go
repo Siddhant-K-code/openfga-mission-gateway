@@ -1012,7 +1012,9 @@ func cloneIntent(intent IntentProposal) IntentProposal {
 }
 
 type CheckResult struct {
-	Name     string `json:"name"`
+	Name string `json:"name"`
+	// Unknown marks a failed lookup, rather than an authoritative denial.
+	Unknown  bool   `json:"unknown,omitempty"`
 	Allowed  bool   `json:"allowed"`
 	Relation string `json:"relation,omitempty"`
 	Object   string `json:"object,omitempty"`
@@ -1056,177 +1058,104 @@ func (gateway *Gateway) Authorize(
 	request AuthorizationRequest,
 	now time.Time,
 ) Decision {
+	checks := make([]CheckResult, 0, 16)
+	check := func(name string, allowed bool) bool {
+		checks = append(checks, CheckResult{Name: name, Allowed: allowed})
+		return allowed
+	}
 	claims, err := gateway.signer.Verify(request.MissionToken, now)
-	if err != nil {
-		return gateway.record(false, err.Error(), nil, nil, request, now)
+	if !check("token_valid", err == nil) {
+		return gateway.record(false, err.Error(), nil, checks, request, now)
 	}
 	mission, err := gateway.missions.Get(claims.MissionID)
-	if err != nil {
-		return gateway.record(false, err.Error(), nil, nil, request, now)
+	if !check("mission_available", err == nil) {
+		return gateway.record(false, err.Error(), nil, checks, request, now)
 	}
-
-	if claims.Agent != request.Agent || mission.Agent != request.Agent {
-		return gateway.record(
-			false,
-			"Mission token is not bound to this agent",
-			mission,
-			[]CheckResult{{Name: "agent_binding", Allowed: false}},
-			request,
-			now,
-		)
+	if !check("agent_binding", claims.Agent == request.Agent && mission.Agent == request.Agent) {
+		return gateway.record(false, "Mission token is not bound to this agent", mission, checks, request, now)
 	}
-	if claims.Version != mission.Version || !sameCallSet(claims.CallIDs, mission.CallIDs()) {
-		return gateway.record(
-			false,
-			"Mission token is stale",
-			mission,
-			[]CheckResult{{Name: "mission_version", Allowed: false}},
-			request,
-			now,
-		)
+	if !check("mission_version", claims.Version == mission.Version && sameCallSet(claims.CallIDs, mission.CallIDs())) {
+		return gateway.record(false, "Mission token is stale", mission, checks, request, now)
 	}
-	if mission.State != MissionActive {
-		return gateway.record(
-			false,
-			"Mission is "+string(mission.State),
-			mission,
-			[]CheckResult{{Name: "mission_active", Allowed: false}},
-			request,
-			now,
-		)
+	if !check("mission_active", mission.State == MissionActive) {
+		return gateway.record(false, "Mission is "+string(mission.State), mission, checks, request, now)
 	}
-	if !mission.ExpiresAt.After(now) {
-		return gateway.record(
-			false,
-			"Mission expired",
-			mission,
-			[]CheckResult{{Name: "mission_expiry", Allowed: false}},
-			request,
-			now,
-		)
+	if !check("mission_expiry", mission.ExpiresAt.After(now)) {
+		return gateway.record(false, "Mission expired", mission, checks, request, now)
 	}
 
 	callID, err := request.Call.ID()
-	if err != nil {
-		return gateway.record(false, err.Error(), mission, nil, request, now)
+	if !check("canonical_call", err == nil) {
+		return gateway.record(false, err.Error(), mission, checks, request, now)
 	}
 	contextualTuples := missionContextualTuples(mission, claims)
 	topology, err := callTopologyTuples(request.Call)
 	if err != nil {
-		return gateway.record(false, err.Error(), mission, nil, request, now)
+		return gateway.record(false, err.Error(), mission, checks, request, now)
 	}
 	contextualTuples = append(contextualTuples, topology...)
 
-	baseAccess, err := gateway.fga.Check(ctx, CheckRequest{
-		User:             mission.Requester,
-		Relation:         "can_invoke",
-		Object:           callID,
-		ContextualTuples: contextualTuples,
-	})
-	if err != nil {
-		return gateway.record(false, "authorization check failed", mission, nil, request, now)
+	// Preserve every completed check, including when a later lookup fails.
+	// An unavailable authority source is UNKNOWN, never an inferred YES.
+	fgaCheck := func(name string, input CheckRequest, resource bool) error {
+		allowed, err := gateway.fga.Check(ctx, input)
+		result := CheckResult{Name: name, Allowed: allowed && err == nil, Unknown: err != nil}
+		if resource {
+			result.Relation, result.Object = input.Relation, input.Object
+		}
+		checks = append(checks, result)
+		return err
 	}
-	agentAccess, err := gateway.fga.Check(ctx, CheckRequest{
-		User:             request.Agent,
-		Relation:         "can_invoke",
-		Object:           callID,
-		ContextualTuples: contextualTuples,
-	})
-	if err != nil {
-		return gateway.record(false, "authorization check failed", mission, nil, request, now)
-	}
-	agentBound, err := gateway.fga.Check(ctx, CheckRequest{
-		User:             request.Agent,
-		Relation:         "executor",
-		Object:           "mission:" + mission.ID,
-		ContextualTuples: contextualTuples,
-	})
-	if err != nil {
-		return gateway.record(false, "authorization check failed", mission, nil, request, now)
-	}
-	missionScope, err := gateway.fga.Check(ctx, CheckRequest{
-		User:             callID,
-		Relation:         "allowed_call",
-		Object:           "mission:" + mission.ID,
-		ContextualTuples: contextualTuples,
-	})
-	if err != nil {
-		return gateway.record(false, "authorization check failed", mission, nil, request, now)
-	}
-
-	checks := []CheckResult{
-		{Name: "requester_base_access", Allowed: baseAccess},
-		{Name: "agent_base_access", Allowed: agentAccess},
-		{Name: "agent_bound_to_mission", Allowed: agentBound},
-		{Name: "mission_call_scope", Allowed: missionScope},
+	for _, gate := range []struct {
+		name, user, relation, object string
+	}{
+		{"requester_base_access", mission.Requester, "can_invoke", callID},
+		{"agent_base_access", request.Agent, "can_invoke", callID},
+		{"agent_bound_to_mission", request.Agent, "executor", "mission:" + mission.ID},
+		{"mission_call_scope", callID, "allowed_call", "mission:" + mission.ID},
+	} {
+		if err := fgaCheck(gate.name, CheckRequest{
+			User: gate.user, Relation: gate.relation, Object: gate.object,
+			ContextualTuples: contextualTuples,
+		}, false); err != nil {
+			return gateway.record(false, "authorization check failed", mission, checks, request, now)
+		}
 	}
 	for _, requirement := range request.Call.canonicalRequirements() {
-		requesterResourceAccess, err := gateway.fga.Check(ctx, CheckRequest{
-			User: mission.Requester, Relation: requirement.Relation, Object: requirement.Object,
-		})
-		if err != nil {
-			return gateway.record(false, "authorization check failed", mission, nil, request, now)
+		for _, principal := range []struct{ name, user string }{
+			{"requester_resource_access", mission.Requester},
+			{"agent_resource_access", request.Agent},
+		} {
+			if err := fgaCheck(principal.name, CheckRequest{
+				User: principal.user, Relation: requirement.Relation, Object: requirement.Object,
+			}, true); err != nil {
+				return gateway.record(false, "authorization check failed", mission, checks, request, now)
+			}
 		}
-		agentResourceAccess, err := gateway.fga.Check(ctx, CheckRequest{
-			User: request.Agent, Relation: requirement.Relation, Object: requirement.Object,
-		})
-		if err != nil {
-			return gateway.record(false, "authorization check failed", mission, nil, request, now)
-		}
-		checks = append(checks,
-			CheckResult{
-				Name: "requester_resource_access", Allowed: requesterResourceAccess,
-				Relation: requirement.Relation, Object: requirement.Object,
-			},
-			CheckResult{
-				Name: "agent_resource_access", Allowed: agentResourceAccess,
-				Relation: requirement.Relation, Object: requirement.Object,
-			},
-		)
 	}
-	for _, check := range checks {
-		if !check.Allowed {
-			return gateway.record(
-				false,
-				"denied by "+check.Name,
-				mission,
-				checks,
-				request,
-				now,
-			)
+	for _, result := range checks {
+		if !result.Allowed {
+			return gateway.record(false, "denied by "+result.Name, mission, checks, request, now)
 		}
 	}
 
 	grant, _ := mission.Grant(callID)
-	if grant.RequiresApproval {
-		approval := CheckResult{
-			Name: "call_approved", Allowed: mission.ApprovedCalls[callID],
-		}
-		checks = append(checks, approval)
-		if !approval.Allowed {
-			return gateway.record(
-				false,
-				"call approval is required",
-				mission,
-				checks,
-				request,
-				now,
-			)
-		}
+	if grant.RequiresApproval && !check("call_approved", mission.ApprovedCalls[callID]) {
+		return gateway.record(false, "call approval is required", mission, checks, request, now)
 	}
 
 	reserveReason, err := gateway.missions.ReserveDispatch(mission.ID, claims.Version, callID, now)
 	if err != nil {
+		checks = append(checks, CheckResult{Name: "mission_dispatch_control", Unknown: true})
 		return gateway.record(false, "authorization check failed", mission, checks, request, now)
 	}
 	if reserveReason != "" {
-		checks = append(checks, CheckResult{Name: "mission_dispatch_control", Allowed: false})
+		check("mission_dispatch_control", false)
 		return gateway.record(false, reserveReason, mission, checks, request, now)
 	}
 	if mission.MaxDispatches > 0 {
-		checks = append(checks, CheckResult{Name: "mission_dispatch_budget", Allowed: true})
+		check("mission_dispatch_budget", true)
 	}
-
 	return gateway.record(true, "authorized", mission, checks, request, now)
 }
 

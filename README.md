@@ -210,17 +210,44 @@ The demo proves:
 
 ## Run the Showcase
 
-The browser demo is a local, stateful walkthrough of the same Mission. It
-shows the proposed call surface, resource graph, approval gate, decisions, and
-timeline.
+The browser demo is a local security decision debugger for the same Mission.
+It shows what Alice delegated, who decides, and why each call is allowed or
+denied:
+
+- **Delegated authority:** requester, agent, live expiry, dispatch budget, exact
+  protected fields, resource requirements, and risk/approval policy. Canonical
+  call IDs are available under Details.
+- **Decision trace:** actual gateway YES/NO checks, UNKNOWN for failed authority
+  lookups, and SKIPPED for checks that did not run. Token and lifecycle evidence
+  is included in each decision; additional checks and raw JSON are expandable.
+- **Approval workflow:** attempting the product post shows a demo preview;
+  “Approve & retry” records Alice’s approval and reauthorizes the call. Approval
+  applies to the canonical call scope, not a cryptographic digest of the preview.
+- **Current authority:** separate tool and resource relationships. Revoking
+  Alice’s work-tracker operator relationship leaves project membership intact
+  but denies the next read. Restore reverses the demo revocation.
+- **Architecture and timeline:** Mission / OpenFGA / Policy / Gateway roles,
+  preconfigured vs. per-task inputs, static POC resolution, and chronological
+  call outcomes, approvals, revocations, and restores.
+
+The HTML, CSS, and JavaScript in `cmd/showcase/web` are embedded in the Go
+binary; no frontend build step or external assets are required.
 
 ```sh
 go run ./cmd/showcase
 ```
 
-Open `http://127.0.0.1:8088`. Use the controls to read the ticket, attempt the
-side effect, approve it, try an out-of-scope channel, or revoke source access.
-`Reset demo` creates a new in-memory Mission.
+Open `http://127.0.0.1:8088` (the default listener is loopback only). Read the
+ticket, attempt the product post, approve and retry, try the company channel,
+then revoke Alice’s work-tracker access and read again. Denied attempts do not
+consume the three-dispatch budget. `Reset demo` creates a fresh in-memory
+Mission and clears decisions, approvals, and demo access changes.
+
+The footer identifies the implementation boundaries: in-memory Mission state,
+an in-memory evaluator of this repository’s OpenFGA model, static candidate
+resolution, and real gateway enforcement. This showcase authorizes calls but
+does **not** send upstream MCP requests; the implemented MCP proxy and its
+Streamable HTTP tests are separate.
 
 ## Test the Live Path
 
